@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+.idea/
+.DS_Store
+# your Wi-Fi default and local port - never committed
+src/wifi_secret.h
+platformio_local*.ini
