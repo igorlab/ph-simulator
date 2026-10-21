@@ -15,6 +15,9 @@ How the leakage is worked out: [docs/leak-measurement.md](docs/leak-measurement.
 
 ![Wiring diagram](docs/wiring.png)
 
+The same circuit as a schematic: [docs/schematic.pdf](docs/schematic.pdf) (KiCad 10 project in
+[hardware/](hardware/)).
+
 ## What it shows
 
 - **A**: the simulator voltage in mV, and the pH it stands for (`pH = 7 - A/59.16`, 25 °C).
@@ -35,9 +38,10 @@ How the leakage is worked out: [docs/leak-measurement.md](docs/leak-measurement.
 | Display | SSD1306 128x64 OLED, I2C 0x3C |
 | Simulator | LR44 cell, DPDT ON-OFF-ON switch (polarity), 6.8 kΩ, 10 kΩ trimmer |
 | Series resistor | 50 MΩ, shorted by a push button for calibration |
+| Reference (VMID) | R6 = R7 = 10 kΩ from 3.3 V to GND, C1 100 nF: holds the floating simulator at 1.65 V |
 | Board connector | BNC female; JST 3-pin (S, +5 V, GND) |
 | S divider | R3 = R4 = 10 kΩ (the ADS gets S/2) |
-| Current shunt | Rsh = 10 Ω in the board's ground |
+| Current shunt | Rsh (R5) = 10 Ω in the board's ground |
 
 Wire by the pin names printed on the modules. Never connect the BNC centre (the
 high-impedance node) to the ADS - its input would itself become the leakage.
@@ -160,5 +164,11 @@ USB CDC, 115200 baud. One CSV line `millis,A_mV,S_V,pH` per measurement cycle (a
 
 ## License
 
-[CC BY-NC-SA 4.0](LICENSE): share and adapt with attribution, not for commercial use,
-derivatives under the same license.
+Open hardware, in three parts (see [LICENSE](LICENSE)):
+
+- hardware (wiring diagram, schematics, boards): [CERN-OHL-S v2](LICENSES/CERN-OHL-S-2.0.txt);
+- firmware and scripts: [GPL-3.0-or-later](LICENSES/GPL-3.0-or-later.txt);
+- documentation and images: [CC BY-SA 4.0](LICENSES/CC-BY-SA-4.0.txt).
+
+You may build, modify, share and sell the device. A modified version you distribute must
+stay under the same licences, with its sources published.
