@@ -37,14 +37,18 @@ The same circuit as a schematic: [docs/schematic.pdf](docs/schematic.pdf) (KiCad
 | ADC | ADS1115 module (I2C 0x48), powered from 3.3 V |
 | Display | SSD1306 128x64 OLED, I2C 0x3C |
 | Simulator | LR44 cell, DPDT ON-OFF-ON switch (polarity), 6.8 kΩ, 10 kΩ trimmer |
-| Series resistor | 50 MΩ, shorted by a push button for calibration |
-| Reference (VMID) | R6 = R7 = 10 kΩ from 3.3 V to GND, C1 100 nF: holds the floating simulator at 1.65 V |
+| Series resistor | 50 MΩ (five 10 MΩ SMD resistors in series), shorted by a push button for calibration |
 | Board connector | BNC female; JST 3-pin (S, +5 V, GND) |
 | S divider | R3 = R4 = 10 kΩ (the ADS gets S/2) |
 | Current shunt | Rsh (R5) = 10 Ω in the board's ground |
 
 Wire by the pin names printed on the modules. Never connect the BNC centre (the
 high-impedance node) to the ADS - its input would itself become the leakage.
+
+Connect the JST to the board under test by function - +5 V to its supply, GND to its
+ground, S to its output - and check the pin order at both ends before you power it up.
+The JST here has +5 V in the middle; the pH board of this project has its ground there
+(P2: 1 VCC, 2 com, 3 S), so the cable between them is crossed.
 
 ## Build and flash
 
@@ -161,6 +165,11 @@ USB CDC, 115200 baud. One CSV line `millis,A_mV,S_V,pH` per measurement cycle (a
   bigger R (1 GΩ) needs the node in air or on PTFE, inside a metal box.
 - The board under test is powered from USB 5 V. A board whose zero follows its supply
   will shift a little if the USB voltage changes between calibration and measurement.
+- Channel A needs a board. The simulator's reference - the trimmer leg, the BNC shield
+  and A1 - has no divider of its own. With a board connected the readings are valid;
+  without one A1 floats and A means nothing. A 10 kΩ / 10 kΩ divider from 3.3 V to GND
+  with 100 nF, its midpoint on A1, would make A valid on its own; the author's unit works
+  without it.
 
 ## License
 
