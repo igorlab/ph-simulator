@@ -144,6 +144,10 @@ a wrong pH and a meaningless leakage figure.
 
 Details, formulas and pitfalls: [docs/leak-measurement.md](docs/leak-measurement.md).
 
+The page's «Download CSV» keeps only time, pH and S. To keep every reading - E, S, the
+board input, the leakage and the calibration line - log what the page itself polls:
+`python3 tools/calibrator_log.py -o run.csv` (type a note and Enter to mark a phase).
+
 ## Serial
 
 USB CDC, 115200 baud. One CSV line `millis,A_mV,S_V,pH` per measurement cycle (about

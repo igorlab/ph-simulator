@@ -147,6 +147,10 @@ monitor_port = /dev/cu.usbmodem1101
 
 Подробиці, формули і пастки: [docs/leak-measurement.md](docs/leak-measurement.md).
 
+«Завантажити CSV» на сторінці зберігає лише час, pH і S. Щоб мати всі покази - E, S, вхід
+плати, витік і пряму калібрування, - пишіть те, що опитує сама сторінка:
+`python3 tools/calibrator_log.py -o run.csv` (текст і Enter позначають фазу досліду).
+
 ## Serial
 
 USB CDC, 115200 бод. Рядок CSV `millis,A_mV,S_V,pH` на кожен цикл виміру (близько
