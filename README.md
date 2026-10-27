@@ -8,7 +8,9 @@ glass electrode would. An ESP32-C3 with an ADS1115 measures E and the board outp
 works out the board's gain and zero from two calibration points, and from then on shows
 the board's **input leakage current** - the fault that makes a board ignore a perfectly
 good electrode while still reacting to a low-impedance test source. Readings go to a
-128x64 OLED and to a web page (EN / UA) with live charts.
+128x64 OLED and to a web page (EN / UA) with live charts. The ESP32-C3 also measures its
+USB 5 V supply through a 15 kΩ / 10 kΩ divider on GPIO4, so supply changes are recorded
+alongside the high-impedance measurements.
 
 Why it exists: [a board that ignored a working electrode](docs/case-study-leaky-board.md).
 How the leakage is worked out: [docs/leak-measurement.md](docs/leak-measurement.md).
@@ -25,6 +27,8 @@ The same circuit as a schematic: [docs/schematic.pdf](docs/schematic.pdf) (KiCad
 - **Leakage current** in nA, how many times it exceeds your limit, and a chart over time.
 - The board's **gain and zero** (two-point line E → S), the **noise** on S and the
   board's **supply current**.
+- **USB supply voltage**, measured by the ESP32-C3 ADC on GPIO4 and calibratable against
+  a multimeter.
 - **Electrode equilibrium**: how fast a real electrode settles after it is dipped
   (time to equilibrium, t63, drift).
 - History in the browser (1 point/s, ~14 h), downloadable as CSV.
@@ -41,6 +45,7 @@ The same circuit as a schematic: [docs/schematic.pdf](docs/schematic.pdf) (KiCad
 | Board connector | BNC female; JST 3-pin (S, +5 V, GND) |
 | S divider | R3 = R4 = 10 kΩ (the ADS gets S/2) |
 | Current shunt | Rsh (R5) = 10 Ω in the board's ground |
+| USB supply divider | R7 = 15 kΩ from USB +5 V to GPIO4; R6 = 10 kΩ from GPIO4 to GND (USB = 2.5 × pin voltage) |
 
 Wire by the pin names printed on the modules. Never connect the BNC centre (the
 high-impedance node) to the ADS - its input would itself become the leakage.

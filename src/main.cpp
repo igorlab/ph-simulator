@@ -1,45 +1,45 @@
 // ============================================================================
-//  pH electrode simulator and leakage tester: ESP32-C3 + ADS1115 + OLED SSD1306
+//  Калібратор pH-плати на ESP32-C3 + ADS1115 + OLED SSD1306
 // ============================================================================
-//  Shows two voltages at once:
-//    A  - the simulator voltage (what the electrode would produce), bipolar (±)
-//    S  - output S of the pH board under test
-//  so the board's transfer characteristic is visible directly: how much S it
-//  gives for a known input A. From two calibration points (series resistor
-//  shorted) it then works out the board's input leakage current.
+//  Показує одночасно дві напруги:
+//    A  — еталонна напруга імітатора (точка А з малюнка 12), біполярна (±)
+//    S  — вихід S плати рН, яку калібруємо
+//  Так одразу видно передавальну характеристику плати: скільки S дає на
+//  відомий вхід A.
 //
 //  --------------------------------------------------------------------------
-//  WIRING (docs/wiring.png). ADS1115 is powered from 3.3 V - 5 V I2C would kill the ESP32-C3
+//  ПІДКЛЮЧЕННЯ (ADS1115 живиться від 3.3 В! I2C 5В спалив би ESP32-C3)
 //  --------------------------------------------------------------------------
-//    ESP32-C3           ->  SDA=GPIO5, SCL=GPIO6  (leave GPIO8/9 alone - strapping/BOOT)
+//    ESP32-C3           ->  SDA=GPIO5, SCL=GPIO6  (НЕ чіпати GPIO8/9 — strapping/BOOT)
 //    OLED SSD1306 0x3C  ->  VCC=3V3, GND=GND, SDA=GPIO5, SCL=GPIO6
 //    ADS1115     0x48   ->  VDD=3V3, GND=GND, SDA=GPIO5, SCL=GPIO6, ADDR->GND
-//    I2C pull-ups 4.7k to 3V3 (the modules usually have them already).
+//    Підтяжки I2C 4.7к до 3V3 (на модулях зазвичай уже стоять).
 //
-//  JST 3-pin = the pH board connector: [ GND ][ +5 V board supply ][ output S ]
-//    +5 V comes from the ESP's 5V pin (i.e. from USB). Board ground returns to the
-//    calibrator's GND through the current shunt Rsh.
+//  JST 3-pin = інтерфейс до плати рН: [ мінус=GND ][ +5В живлення плати ][ вихід S ]
+//    +5В беремо з піна 5V ESP (тобто з USB). Земля плати = GND калібратора.
 //
-//  CHANNEL A (simulator millivolts) - DIFFERENTIAL AIN0-AIN1:
-//    AIN0 <- trimmer wiper (taken BEFORE the series resistor, on the low-impedance side)
-//    AIN1 <- the trimmer leg that goes to the BNC shield (the reference)
-//    The simulator runs on its own battery, i.e. it floats; A0-A1 is the signed voltage
-//    between wiper and reference, range at 3.3 V about ±1.6 V.
-//    Never wire the BNC centre (the high-impedance node) to the ADS: the ADS input
-//    would itself become the leakage being measured.
+//  КАНАЛ A (мілівольти імітатора) — ДИФЕРЕНЦІЙНО AIN0-AIN1:
+//    AIN0 <- повзунок (центральна ніжка потенціометра 10к)
+//    AIN1 <- ліва ніжка потенціометра; ЦЕЙ ВУЗОЛ прив'язати до VMID (~1.65 В).
+//    Вхід «плаваючий» (імітатор на своїй батарейці, ізольований). Диф-входи
+//    ADS не ізольовані, тож без прив'язки до землі ADS вони «спливуть» і дадуть
+//    сміття — саме тому ліва ніжка сидить на VMID. Результат A0-A1 = знакова
+//    напруга між повзунком і лівою ніжкою; діапазон при 3.3 В ~ ±1.6 В.
+//    ВАЖЛИВО: землю імітатора нікуди більше НЕ з'єднувати (лише ліва ніжка->VMID),
+//    інакше закоротиш VMID.
 //
-//  CHANNEL S (pH board output, 0..5 V) - SINGLE-ENDED AIN2 to GND:
-//    S -> divider ÷2 (R3=R4=10k, bottom to GND) -> AIN2. 0..5 V becomes 0..2.5 V,
-//    which is safe for the ADS at 3.3 V. The firmware multiplies back by S_DIVIDER.
+//  КАНАЛ S (вихід плати рН, 0..5 В) — ОДНОПОЛЮСНО AIN2 відносно GND:
+//    S -> дільник ÷2 (R3=R4=10к, низ на GND) -> AIN2. Так 0..5 В стає 0..2.5 В,
+//    що безпечно для ADS при 3.3 В. У прошивці множимо назад на S_DIVIDER.
 //
-//  BOARD CURRENT - SINGLE-ENDED AIN3: low-side shunt Rsh in the board's ground.
+//  VMID (опора для AIN1): дільник 2×10к від 3V3 до GND + 0.1мкФ від середини
+//  до GND (гасить кидки заряду входів ADS). Для макс. точності — буфер на ОП.
 //
 //  --------------------------------------------------------------------------
-//  Serial (USB CDC, 115200): prints CSV "millis,A_mV,S_V,pH" and takes commands:
-//    z  - autozero channel A (store the present A as 0.000 V in NVS)
-//    Z  - clear the autozero
-//    r  - print the stored calibration
-//    v  - wiring check: each ADS input AIN0..AIN3 single-ended against GND
+//  Serial (USB CDC, 115200): друкує CSV "millis,A_мВ,S_В,pH,S_сире_В,падіння_шунта_В,I_мА" + приймає команди:
+//    z  — автонуль каналу A (запам'ятати поточне A як 0.000 В у NVS)
+//    Z  — скинути автонуль
+//    r  — показати збережені калібрування
 // ============================================================================
 
 #include <Arduino.h>
@@ -47,152 +47,150 @@
 #include <Preferences.h>
 #include <math.h>
 #include <Adafruit_ADS1X15.h>
-#include <U8g2lib.h>   // display through u8g2 (Adafruit_SSD1306 would not drive this panel)
+#include <U8g2lib.h>   // дисплей через u8g2 (Adafruit_SSD1306 не заводила цю панель)
 
-// Web interface: own access point + captive DNS + asynchronous server.
-// The async server runs in the AsyncTCP task, so HTTP never blocks measuring or the display,
-// and I2C (ADS/OLED) is done ONLY in loop(); web handlers just read shared values
-// and raise flags - neither path ever holds up the other.
+// Веб-інтерфейс: власна точка доступу + captive-DNS + асинхронний сервер.
+// Асинхронний сервер працює у таску AsyncTCP, тож HTTP не блокує вимір/екран,
+// а I2C (ADS/OLED) робиться ТІЛЬКИ в loop(); веб-обробники лише читають спільні
+// значення й виставляють прапорці — жоден тракт не тримає інший.
 #include <WiFi.h>
-#include <esp_wifi.h>      // esp_wifi_set_country (allow channels 12/13 in the EU)
+#include <esp_wifi.h>      // esp_wifi_set_country (дозволити канали 12/13 у EU)
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
-
-// Calibrator firmware version - shown on the page (/info) and on Serial at start-up.
-#define CAL_VERSION "1.1.1"
-
-// The Wi-Fi network is set on the web page (Wi-Fi block) and kept in NVS (namespace "wifi").
-// An optional src/wifi_secret.h (not in git) gives a default network for your own build -
-// used only until another one is saved on the page or «Forget the network» is pressed.
 #if __has_include("wifi_secret.h")
-#include "wifi_secret.h"   // WIFI_SSID / WIFI_PASS
-#endif
-#ifndef WIFI_SSID
+#include "wifi_secret.h"   // локальні WIFI_SSID / WIFI_PASS; файл не в репозиторії
+#else
 #define WIFI_SSID ""
-#endif
-#ifndef WIFI_PASS
 #define WIFI_PASS ""
 #endif
 
-// ----------------------------- Settings -------------------------------------
+// ----------------------------- Налаштування ---------------------------------
 static const uint8_t PIN_SDA = 5;
 static const uint8_t PIN_SCL = 6;
 
+// Напруга живлення USB — вбудований АЦП ESP32-C3 (окремий від ADS1115, бо всі 4 входи ADS зайняті).
+// GPIO4 = ADC1_CH4. Зовнішній дільник 15k(верх)+10k(низ): на піні 0.4·USB (2.0 В при 5.0 В).
+static const uint8_t PIN_USB_ADC    = 4;
+static const float   USB_DIV_DEFAULT = 2.5f;   // USB = Vpin·(15k+10k)/10k = Vpin·2.5
+
 static const uint8_t ADDR_ADS  = 0x48;   // ADDR->GND
-static const uint8_t ADDR_OLED = 0x3C;   // usual 128x64 address
+static const uint8_t ADDR_OLED = 0x3C;   // типова адреса 128x64
 
 static const uint8_t  OLED_W = 128;
 static const uint8_t  OLED_H = 64;
 
-// Samples averaged per channel. 25 at 250 SPS = exactly 100 ms = 5 periods of 50 Hz
-// mains -> hum is rejected best (matters for high-impedance measurements, 100 MOhm).
+// Скільки вибірок усереднювати на канал. 25 при 250 SPS = рівно 100 мс = 5 періодів
+// мережі 50 Гц -> наводка гаситься найкраще (важливо для високоомних вимірів, 100 МОм).
 static const uint8_t  SAMPLES = 25;
 
-// Display/log update period, ms
+// Період оновлення екрана/логу, мс (100 мс = ~10 оновлень/с)
 static const uint32_t PERIOD_MS = 100;
 
-// Adaptive smoothing of A and S: a real change passes AT ONCE (no lag), while
-// flicker in the last digit is smoothed by an EMA. SNAP = the "at once" threshold.
-static const float DISP_ALPHA = 0.35f;   // smoothing strength for small noise
-static const float SNAP_A = 0.0004f;     // A: a step > 0.4 mV passes at once
-static const float SNAP_S = 0.003f;      // S: a step > 3 mV passes at once
+// Адаптивний згладжувач показів A і S: помітна зміна проходить МИТТЄВО (без лагу),
+// а дрібне миготіння молодшого розряду згладжується EMA. SNAP — поріг «одразу».
+static const float DISP_ALPHA = 0.35f;   // сила згладжування дрібного шуму
+static const float SNAP_A = 0.0004f;     // A: стрибок > 0.4 мВ -> одразу
+static const float SNAP_S = 0.003f;      // S: стрибок > 3 мВ -> одразу
 
-// ADS1115 gain ranges (pick for your voltages):
-//   A: ±1.6 V -> GAIN_TWO (±2.048 V, 62.5 µV/LSB). If the simulator only gives
-//      small voltages (e.g. ±0.5 V), GAIN_FOUR (±1.024) gives more resolution.
-//   S: after ÷2 it is 0..2.5 V -> GAIN_ONE (±4.096 V) with headroom.
+// Діапазони підсилення ADS1115 (обери під свої напруги):
+//   A: ±1.6 В -> GAIN_TWO (±2.048 В, 62.5 мкВ/LSB). Якщо імітатор дає лише
+//      малі мілівольти (напр. ±0.5 В) — можна GAIN_FOUR (±1.024) для роздільності.
+//   S: після ÷2 це 0..2.5 В -> GAIN_ONE (±4.096 В) з запасом.
 static const adsGain_t GAIN_A = GAIN_TWO;
 static const adsGain_t GAIN_S = GAIN_ONE;
 
-// Sign of channel A. Check (README, «Sign of channel A»): button pressed, multimeter
-// between BNC centre and shield - A must have the SAME sign as the meter.
-// If the signs differ, change -1.0 <-> 1.0 here (or swap the AIN0/AIN1 wires).
-// -1.0 is for the author's calibrator: its wiper and reference leg are the other way round.
+// Знак каналу A: -1.0, бо повзунок/ліва ніжка підключені навпаки (1.0 = як є).
 static const float A_SIGN = -1.0f;
 
-// External divider on input S, in series: S -[10k]- AIN2 -[10k]- ground,
-// so AIN2 = S/2 and the code multiplies back by 2. The ADS input stays below ~2.1 V
-// even at S = 4.2 V (within the 3.3 V supply).
+// Зовнішній дільник на вході S, послідовно: S -[10к]- AIN2 -[10к]- земля,
+// тож AIN2 = S/2, у коді множимо назад на 2. Так вхід ADS не перевищує ~2.1 В
+// навіть при S = 4.2 В (у межах живлення 3.3 В).
 static const float S_DIVIDER = 2.0f;
 
-// S measurement: 0 -> single-ended AIN2 to GND (S = 0..5 V through the ÷2 divider).
-//                1 -> differential AIN2-AIN3 (kept in case S is ever bipolar).
+// Вимір S: 0 -> однополюсний AIN2 відносно GND (S = 0..5 В через дільник ÷2).
+//          1 -> диференційний AIN2-AIN3 (лишено на випадок біполярного S).
 #define S_DIFFERENTIAL 0
 
-// pH board supply current: low-side shunt Rsh in the board's ground -> AIN3.
-//   All of the board's return current flows through Rsh; I = V(AIN3) / R_SHUNT.
-//   A few mA in 10 Ohm -> tens of mV (within ±0.512 V).
-static const adsGain_t GAIN_I  = GAIN_EIGHT;   // ±0.512 V (15.6 µV/LSB) -> up to ~51 mA at 10 Ohm
-static const float     R_SHUNT = 10.0f;        // Ohm (shunt in the board's ground)
+// Струм споживання плати рН: низькосторонній шунт Rш у землі плати -> AIN3.
+//   Уся зворотна земля плати йде через Rш; I = V(AIN3) / R_SHUNT_OHM.
+//   Кілька мА при 10 Ом -> ~десятки мВ (у межах ±0.512 В).
+static const adsGain_t GAIN_I  = GAIN_EIGHT;   // ±0.512 В (15.6 мкВ/LSB) -> до ~51 мА при 10 Ом
+static const float     R_SHUNT_OHM = 10.0f;    // Ом (шунт у землі плати)
+static const uint8_t   LEAK_CAL_S_REV = 1;     // ревізія 1: точки калібрування зняті за S із поправкою на шунт
 
-// pH from the channel A millivolts (Nernst): pH 7 at 0 mV, "+" mV -> acid.
-//   0 mV=pH7, +59.16 mV=pH6, +414 mV≈pH0, -59.16 mV=pH8, -414 mV≈pH14.
-static const float PH_ISO   = 7.0f;      // pH at 0 mV
-static const float PH_SLOPE = 59.16f;    // mV per pH (25 °C)
+// pH з мілівольтів каналу A (Нернст): pH7 при 0 мВ, "+" мВ -> кислота.
+//   0 мВ=pH7, +59.16 мВ=pH6, +414 мВ≈pH0, -59.16 мВ=pH8, -414 мВ≈pH14.
+static const float PH_ISO   = 7.0f;      // pH при 0 мВ
+static const float PH_SLOPE = 59.16f;    // мВ на 1 pH (25°C)
 
-// --- Web / access point / DNS ---
-static const char* AP_SSID = "pH-Calibrator";   // the calibrator's own network
-static const char* AP_PASS = "calib1234";        // its password (>= 8 characters)
+// --- Веб / точка доступу / DNS ---
+static const char* AP_SSID = "pH-Calibrator";   // ім'я мережі приладу
+static const char* AP_PASS = "calib1234";        // пароль (>=8 символів)
 static const char* HOSTNAME = "calibrator";      // mDNS -> http://calibrator.local
 static const byte  DNS_PORT = 53;
 
-// Series resistor between the simulator source and the board input (for the leakage).
-// Can be changed on the web page; 50 MOhm by default. Kept in NVS.
-static const float R_SERIES_DEFAULT = 50.0e6f;   // Ohm
+// Послідовний резистор між джерелом імітатора і входом плати (для струму витоку).
+// Значення можна змінити на веб-сторінці; типово 10 МОм. Зберігається в NVS.
+static const float R_SERIES_DEFAULT = 10.0e6f;   // Ом
 
-// Leakage limit, nA. The page shows how many times the leakage exceeds it.
-// Changed on the web page, kept in NVS.
-static const float LEAK_NORM_DEFAULT = 5.0f;   // nA
+// Норма (допустимий) струм витоку, нА. Дашборд показує, у скільки разів витік
+// вищий за неї. Змінюється на веб-сторінці, зберігається в NVS.
+static const float LEAK_NORM_DEFAULT = 5.0f;   // нА
 
-// ----------------------------- Objects --------------------------------------
+// ----------------------------- Об'єкти --------------------------------------
 Adafruit_ADS1115 ads;
-// u8g2, hardware I2C on the same pins (rotation, reset, clock=SCL, data=SDA)
+// u8g2, апаратний I2C на тих самих пінах (rotation, reset, clock=SCL, data=SDA)
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
 Preferences prefs;
 
 bool  adsOk  = false;
 bool  oledOk = false;
 
-// Calibration (NVS namespace "cal"): only the autozero of A.
-// The dead multipliers scaleA/scaleS and the offset offsetS are gone - a stale
-// sclS left in NVS by an older firmware used to double the S reading.
-float offsetA = 0.0f;   // channel A autozero, V (command 'z')
+// Калібрування (у NVS, namespace "cal"): лише autozero A.
+// Мертві множники scaleA/scaleS та зсув offsetS прибрано — стале значення
+// sclS у NVS (від попередньої прошивки) двоїло показ S.
+float offsetA = 0.0f;   // автонуль каналу A, В (команда 'z')
 
-// --- Web server and DNS ---
+// --- Веб-сервер і DNS ---
 DNSServer      dnsServer;
 AsyncWebServer server(80);
+AsyncEventSource events("/events");   // SSE: сервер пушить телеметрію (як у титраторі), клієнт — EventSource
 bool           wifiOk = false;
-bool           apMode = false;   // true = own access point is up (fallback mode)
-uint32_t       wifiStartMs = 0;  // when the STA connection started (timeout in loop)
+bool           apMode = false;   // true = піднято власну точку доступу (запасний режим)
+uint32_t       wifiStartMs = 0;  // коли почали під'єднання STA (для тайм-ауту у loop)
 bool           staConnected = false;
-char           g_ip[20]     = "";   // IP shown on the OLED (ASCII)
-uint32_t       connMsgUntil = 0;    // show the network screen until this time, ms
-String         wifiSsid, wifiPass;  // network: from NVS ("wifi"), else from wifi_secret.h
-uint32_t       restartAt = 0;       // restart after a network is saved (0 = no)
+char           g_ip[20]     = "";   // IP/адреса приладу для показу на OLED (ASCII)
+uint32_t       connMsgUntil = 0;    // показувати екран стану мережі до цього часу, мс
 
-// Latest readings - written by loop(), read by the web handlers (another task).
-// 32-bit floats are read/written atomically on RISC-V; volatile forces a re-read.
-// Telemetry only, no lock needed.
-volatile float g_E_mV    = 0.0f;   // A, mV (signed)
-volatile float g_S_V     = 0.0f;   // S, V
+// Останні виміри — оновлює loop(), читають веб-обробники (інший таск).
+// 32-бітні float на RISC-V читаються/пишуться атомарно; volatile гарантує
+// перечитування. Це лише телеметрія, блокування не потрібне.
+volatile float g_E_mV    = 0.0f;   // A, мВ (зі знаком)
+volatile float g_S_V     = 0.0f;   // S з поправкою на шунт (вихід плати відносно її GND), В
+volatile float g_S_raw_V = 0.0f;   // S сире: вимір ADS відносно GND калібратора, В
+volatile float g_shuntDrop_V = 0.0f; // I·Rш, віднятий від сирого S, В
+volatile bool  g_shuntValid = false; // поправка застосована (струм у межах)
 volatile float g_pH      = 7.0f;
-volatile float g_Vin_mV  = 0.0f;   // calculated board input, mV
-volatile float g_Ileak_nA= 0.0f;   // leakage current, nA
-volatile float g_noise_mV= 0.0f;   // spread of S within a cycle, mV (RMS)
-volatile float g_I_mA    = 0.0f;   // pH board supply current, mA (shunt on AIN3)
+volatile float g_Vin_mV  = 0.0f;   // розрахований вхід плати, мВ
+volatile float g_Ileak_nA= 0.0f;   // струм витоку, нА
+volatile float g_noise_mV= 0.0f;   // розкид S за цикл, мВ (СКВ)
+volatile float g_I_mA    = 0.0f;   // струм споживання плати рН, мА (шунт на AIN3)
+volatile float g_usb_V   = 0.0f;   // напруга живлення USB, В (вбудований АЦП GPIO4)
+float g_usb_pin_mV = 0.0f;         // останнє сире читання на піні дільника, мВ (для калібр.)
+float usbScale     = USB_DIV_DEFAULT;  // калібрований коеф. дільника USB (NVS "usbc")
 
-// Leakage calibration (NVS namespace "leak"): the line S = zeroS + gainS*E.
+// Калібрування витоку (NVS namespace "leak"): лінія S = zeroS + gainS*E.
 bool  haveP1 = false, haveP2 = false;
-float E1_mV = 0, S1_V = 0;         // point 1 (button pressed)
-float E2_mV = 0, S2_V = 0;         // point 2
-float gainS  = 0;                  // V per mV (slope of S over E)
-float zeroS  = 0;                  // V (S at E=0)
-float Rseries = R_SERIES_DEFAULT;  // Ohm
-float leakNormNA = LEAK_NORM_DEFAULT;  // leakage limit, nA
-bool  calValid = false;            // is the line known (two points)
+float E1_mV = 0, S1_V = 0;         // точка 1 (вимикач замкнено)
+float E2_mV = 0, S2_V = 0;         // точка 2
+float gainS  = 0;                  // В на мВ (нахил S по E)
+float zeroS  = 0;                  // В (S при E=0)
+float Rseries = R_SERIES_DEFAULT;  // Ом
+float leakNormNA = LEAK_NORM_DEFAULT;  // норма (допустимий) витік, нА
+bool  calValid = false;            // чи порахована пряма (дві точки)
 
-// Request flags from the web handlers -> carried out by loop() (I2C/NVS in one task).
+// Прапорці-запити від веб-обробників -> виконує loop() (щоб I2C/NVS робив 1 таск).
 volatile bool  req_capP1  = false;
 volatile bool  req_capP2  = false;
 volatile bool  req_calRst = false;
@@ -201,17 +199,40 @@ volatile bool  req_setR   = false;
 volatile float req_Rval   = 0.0f;
 volatile bool  req_setNorm = false;
 volatile float req_NormVal = 0.0f;
-volatile bool  req_wifiSave   = false;   // save req_ssid/req_pass and restart
-volatile bool  req_wifiForget = false;   // erase the network and restart as an access point
-char           req_ssid[33]   = "";
-char           req_pass[64]   = "";
 
-// ----------------------------- Utilities ------------------------------------
+// --- Буферне калібрування електрода (3 точки, NVS "phbuf") ---
+// Калібруємо у мВ ЕЛЕКТРОДА (g_Vin_mV, відновлений з S), двосегментна мапа vin->pH.
+// Передумова: пряма E->S (calValid) вже порахована — тоді vin має сенс.
+static const float BUF_PH[3] = { 4.01f, 6.86f, 9.18f };  // кислий / середній / лужний
+float bufVin[3]  = { 0, 0, 0 };          // зняті мВ електрода у кожному буфері
+bool  bufHave[3] = { false, false, false };
+bool  phCalValid = false;                // чи є всі 3 валідні точки
+float phSlopeAcid = 0, phSlopeBase = 0;  // мВ/pH (кислий 4-7 / лужний 7-9 сегмент)
+float phOffset_mV = 0;                   // мВ електрода при pH 7 (зсув електрода)
+volatile float g_pH_real = 7.0f;         // pH з виходу плати (буфер.калібр. або ідеал. Нернст)
+volatile int   req_bufCap = 0;           // 0=нема; 1..3 = зняти буфер (індекс+1)
+volatile bool  req_bufClr = false;
+float bufTempC = 25.0f;                   // температура буферів, °C (поправка номіналів)
+// Температурні коеф. буферів (pH/°C, лінеаризація біля 25°C): 4.01 майже плоский,
+// 6.86 фосфат, 9.18 борат — найчутливіший.
+static const float BUF_TC[3] = { 0.0012f, -0.0025f, -0.0082f };
+volatile bool  req_setTemp = false;
+volatile float req_TempVal = 25.0f;
+volatile bool  req_setBuf = false;       // відновлення буферів: вписати збережені vin (мВ) + T
+volatile float req_bufV[3] = { 0, 0, 0 };
+volatile float req_bufTcV = 25.0f;
+volatile bool  req_calUsb = false;       // калібрувати дільник USB за відомою напругою
+volatile float req_usbTrue = 5.0f;
+
+// ----------------------------- Утиліти --------------------------------------
 static void loadCal() {
   prefs.begin("cal", true);
   offsetA = prefs.getFloat("offA", 0.0f);
   prefs.end();
 }
+
+static void loadUsbCal() { prefs.begin("usbc", true);  usbScale = prefs.getFloat("k", USB_DIV_DEFAULT); prefs.end(); }
+static void saveUsbCal() { prefs.begin("usbc", false); prefs.putFloat("k", usbScale);                   prefs.end(); }
 
 static void saveFloat(const char* key, float v) {
   prefs.begin("cal", false);
@@ -219,48 +240,17 @@ static void saveFloat(const char* key, float v) {
   prefs.end();
 }
 
-// Wi-Fi network: the one saved on the page (NVS) wins. Key "ssid" present but empty =
-// the network was forgotten on purpose -> access point at once, no wifi_secret.h fallback.
-static void loadWifi() {
-  bool saved = false;
-  if (prefs.begin("wifi", true)) {
-    saved = prefs.isKey("ssid");
-    if (saved) { wifiSsid = prefs.getString("ssid", ""); wifiPass = prefs.getString("pass", ""); }
-    prefs.end();
-  }
-  if (!saved) { wifiSsid = WIFI_SSID; wifiPass = WIFI_PASS; }
-}
-
-static void saveWifi(const char* ssid, const char* pass) {
-  prefs.begin("wifi", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
-  prefs.end();
-}
-
-// String inside JSON quotes: an SSID may contain quotes and backslashes.
-static String jsonEsc(const String& s) {
-  String o; o.reserve(s.length() + 2);
-  for (size_t i = 0; i < s.length(); i++) {
-    char ch = s[i];
-    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
-    else if ((uint8_t)ch < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", ch); o += b; }
-    else o += ch;
-  }
-  return o;
-}
-
-// The line S=zeroS+gainS*E from the two points (if they differ in E).
+// Порахувати пряму S=zeroS+gainS*E з двох точок (якщо вони різні за E).
 static void computeLeakCal() {
   calValid = false;
   if (haveP1 && haveP2 && fabsf(E2_mV - E1_mV) > 1e-3f) {
-    gainS = (S2_V - S1_V) / (E2_mV - E1_mV);   // V/mV
-    zeroS = S1_V - gainS * E1_mV;              // V at E=0
+    gainS = (S2_V - S1_V) / (E2_mV - E1_mV);   // В/мВ
+    zeroS = S1_V - gainS * E1_mV;              // В при E=0
     calValid = true;
   }
 }
 
-// Load the leakage calibration from NVS (namespace "leak").
+// Завантажити калібрування витоку з NVS (namespace "leak").
 static void loadLeak() {
   prefs.begin("leak", true);
   haveP1 = prefs.getBool("h1", false);
@@ -269,11 +259,15 @@ static void loadLeak() {
   E2_mV  = prefs.getFloat("E2", 0);  S2_V = prefs.getFloat("S2", 0);
   Rseries= prefs.getFloat("R",  R_SERIES_DEFAULT);
   leakNormNA = prefs.getFloat("norm", LEAK_NORM_DEFAULT);
+  const uint8_t sRev = prefs.getUChar("srev", 0);
   prefs.end();
+  // Точки з прошивки до поправки зняті за сирим S. Змішувати їх із живим S без шунта не можна:
+  // Vin і витік зіпсуються, тому потрібне одноразове нове двоточкове калібрування.
+  if (sRev != LEAK_CAL_S_REV) haveP1 = haveP2 = false;
   computeLeakCal();
 }
 
-// Save the whole leakage state (points + R + limit) to NVS.
+// Зберегти весь стан витоку (точки + R) в NVS.
 static void saveLeak() {
   prefs.begin("leak", false);
   prefs.putBool("h1", haveP1);  prefs.putBool("h2", haveP2);
@@ -281,6 +275,56 @@ static void saveLeak() {
   prefs.putFloat("E2", E2_mV);  prefs.putFloat("S2", S2_V);
   prefs.putFloat("R",  Rseries);
   prefs.putFloat("norm", leakNormNA);
+  prefs.putUChar("srev", LEAK_CAL_S_REV);
+  prefs.end();
+}
+
+// Температурно-скоригований номінал буфера i (25°C-значення + коеф.*(T-25)).
+static inline float bufPhAt(int i) { return BUF_PH[i] + BUF_TC[i] * (bufTempC - 25.0f); }
+
+// Порахувати двосегментну мапу vin(мВ)->pH з трьох буферних точок.
+// vin спадає зі зростанням pH (Нернст: vin=59.16*(7-pH)); пивот — середній буфер.
+static void computePhCal() {
+  phCalValid = false;
+  if (!(bufHave[0] && bufHave[1] && bufHave[2])) return;
+  float p0 = bufPhAt(0), p1 = bufPhAt(1), p2 = bufPhAt(2);
+  float dphA = p1 - p0, dphB = p2 - p1;
+  if (fabsf(dphA) < 0.1f || fabsf(dphB) < 0.1f) return;
+  phSlopeAcid = (bufVin[1] - bufVin[0]) / dphA;   // ~ -59 мВ/pH
+  phSlopeBase = (bufVin[2] - bufVin[1]) / dphB;
+  if (fabsf(phSlopeAcid) < 1e-3f || fabsf(phSlopeBase) < 1e-3f) return;
+  phOffset_mV = bufVin[1] + phSlopeAcid * (7.0f - p1);   // vin при pH7 (зсув)
+  phCalValid = true;
+}
+
+// pH з мВ електрода за буферним калібруванням (двосегментно, з екстраполяцією).
+static float phFromBuf(float vin_mV) {
+  float p1 = bufPhAt(1);
+  if (vin_mV >= bufVin[1])                                  // кислий бік (vin вищий)
+    return p1 + (vin_mV - bufVin[1]) / phSlopeAcid;
+  return p1 + (vin_mV - bufVin[1]) / phSlopeBase;           // лужний бік
+}
+
+static void loadPhCal() {
+  prefs.begin("phbuf", true);
+  for (int i = 0; i < 3; i++) {
+    char k[6];
+    snprintf(k, sizeof(k), "v%d", i); bufVin[i]  = prefs.getFloat(k, 0);
+    snprintf(k, sizeof(k), "h%d", i); bufHave[i] = prefs.getBool(k, false);
+  }
+  bufTempC = prefs.getFloat("tc", 25.0f);
+  prefs.end();
+  computePhCal();
+}
+
+static void savePhCal() {
+  prefs.begin("phbuf", false);
+  for (int i = 0; i < 3; i++) {
+    char k[6];
+    snprintf(k, sizeof(k), "v%d", i); prefs.putFloat(k, bufVin[i]);
+    snprintf(k, sizeof(k), "h%d", i); prefs.putBool(k, bufHave[i]);
+  }
+  prefs.putFloat("tc", bufTempC);
   prefs.end();
 }
 
@@ -289,21 +333,21 @@ static void i2cScan() {
   for (uint8_t a = 1; a < 127; a++) {
     Wire.beginTransmission(a);
     if (Wire.endTransmission() == 0) {
-      Serial.printf("  found 0x%02X\n", a);
+      Serial.printf("  знайдено 0x%02X\n", a);
     }
   }
 }
 
-// Averaged channel A (differential AIN0-AIN1), returns volts.
+// Усереднений вимір каналу A (диференційний AIN0-AIN1), повертає вольти.
 static float readA() {
   ads.setGain(GAIN_A);
   int32_t acc = 0;
   for (uint8_t i = 0; i < SAMPLES; i++) acc += ads.readADC_Differential_0_1();
-  float v = A_SIGN * ads.computeVolts((int16_t)(acc / SAMPLES));   // polarity
+  float v = A_SIGN * ads.computeVolts((int16_t)(acc / SAMPLES));   // інверсія полярності
   return v - offsetA;
 }
 
-// Averaged channel S, returns volts. Also works out the noise (RMS) -> g_noise_mV.
+// Усереднений вимір каналу S, повертає вольти. Побіжно рахує шум (СКВ) -> g_noise_mV.
 static float readS() {
   ads.setGain(GAIN_S);
   int16_t s[SAMPLES];
@@ -317,38 +361,63 @@ static float readS() {
     acc += s[i];
   }
   float meanCnt = (float)acc / SAMPLES;
-  // RMS in counts -> volts at the board output (divider included)
+  // СКВ у відліках -> вольти на вході плати (з урахуванням дільника)
   float sq = 0;
   for (uint8_t i = 0; i < SAMPLES; i++) { float d = s[i] - meanCnt; sq += d * d; }
   float stdCnt = sqrtf(sq / SAMPLES);
   g_noise_mV = ads.computeVolts((int16_t)lroundf(stdCnt)) * S_DIVIDER * 1000.0f;
   float v = ads.computeVolts((int16_t)lroundf(meanCnt));
-  return v * S_DIVIDER;   // ×2: undo the external ÷2 divider on input S
+  return v * S_DIVIDER;   // ×2: компенсуємо зовнішній дільник ÷2 на вході S
 }
 
-// pH board supply current: mean of AIN3 (single-ended) - the drop across Rsh -> mA.
+// Струм споживання плати рН: середнє AIN3 (однополюсно) — падіння на шунті Rш -> мА.
 static float readI() {
   ads.setGain(GAIN_I);
   int32_t acc = 0;
   for (uint8_t i = 0; i < SAMPLES; i++) acc += ads.readADC_SingleEnded(3);
-  float v = ads.computeVolts((int16_t)(acc / SAMPLES));   // drop across the shunt, V
-  if (v < 0) v = 0;                                        // noise around zero
-  return v / R_SHUNT * 1000.0f;                            // mA
+  float v = ads.computeVolts((int16_t)(acc / SAMPLES));   // падіння на шунті, В
+  if (v < 0) v = 0;                                        // шум біля нуля
+  return v / R_SHUNT_OHM * 1000.0f;                        // мА
 }
 
-// Signed voltage with 3 decimals: "+1.234"
+// AIN2 міряє S відносно GND калібратора, а GND плати вище на I·Rш (її струм тече через шунт).
+// Тож власний вихід плати = сире S мінус це додатне падіння.
+static bool correctSForShunt(float sRaw_V, float current_mA, float& sBoard_V, float& shuntDrop_V) {
+  if (!isfinite(sRaw_V) || !isfinite(current_mA) || current_mA < 0.0f) {
+    sBoard_V = sRaw_V; shuntDrop_V = 0.0f;
+    return false;
+  }
+  shuntDrop_V = current_mA * R_SHUNT_OHM / 1000.0f;
+  sBoard_V = sRaw_V - shuntDrop_V;
+  if (!isfinite(sBoard_V) || !isfinite(shuntDrop_V)) {
+    sBoard_V = sRaw_V; shuntDrop_V = 0.0f;
+    return false;
+  }
+  return true;
+}
+
+// Напруга живлення USB: вбудований АЦП ESP32-C3 на GPIO4 через зовнішній дільник 15k/10k.
+// Канал A3 ADS зайнятий струмом плати, тож USB міряємо власним АЦП контролера.
+static float readUsb() {
+  uint32_t acc = 0;
+  for (uint8_t i = 0; i < 16; i++) acc += analogReadMilliVolts(PIN_USB_ADC);
+  g_usb_pin_mV = acc / 16.0f;                   // мВ на піні (калібрований eFuse АЦП)
+  return g_usb_pin_mV * usbScale / 1000.0f;     // В на вході USB
+}
+
+// Формат напруги зі знаком, 3 знаки після коми: "+1.234"
 static void fmtV(char* buf, size_t n, float v) {
   snprintf(buf, n, "%+.3f", (double)v);
 }
 
-// Does a device answer at this address (u8g2.begin does not check the ACK, so we do)
+// Чи відповідає пристрій на адресі (u8g2.begin не перевіряє ACK, тож детектимо самі)
 static bool i2cPresent(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
 }
 
-// ----------------------------- Display --------------------------------------
-// pH from the channel A voltage (in volts), Nernst
+// ----------------------------- Екран ----------------------------------------
+// pH з напруги каналу A (у вольтах) за Нернстом
 static float phFromA(float va) {
   return PH_ISO - (va * 1000.0f) / PH_SLOPE;
 }
@@ -357,18 +426,18 @@ static void drawScreen(float va, float vs) {
   if (!oledOk) return;
   char lph[24], nA[16], nS[16];
   snprintf(lph, sizeof(lph), "pH %.2f  %dmA", phFromA(va), (int)lroundf(g_I_mA));
-  snprintf(nA,  sizeof(nA),  "%.1f", (va * 1000.0f));   // signed number, large
+  snprintf(nA,  sizeof(nA),  "%.1f", (va * 1000.0f));   // число зі знаком, велике
   snprintf(nS,  sizeof(nS),  "%.3f", vs);
 
   oled.clearBuffer();
   int x;
 
-  // pH - large, centred (baseline a little lower so the top is not clipped)
+  // pH — великим, по центру (baseline трохи нижче, щоб не різало верх)
   oled.setFont(u8g2_font_helvB14_tr);
   x = (128 - oled.getStrWidth(lph)) / 2;
   oled.drawStr(x, 19, lph);
 
-  // A: small letter + large digits + small unit "mV"
+  // A: дрібна літера + великі цифри + дрібна одиниця "mV"
   oled.setFont(u8g2_font_helvB12_tr);
   oled.drawStr(0, 42, "A: ");
   x = oled.getStrWidth("A: ") + 4;
@@ -378,7 +447,7 @@ static void drawScreen(float va, float vs) {
   oled.setFont(u8g2_font_helvB12_tr);
   oled.drawStr(x, 42, "mV");
 
-  // S: small letter + large digits + small unit "V"
+  // S: дрібна літера + великі цифри + дрібна одиниця "V"
   oled.setFont(u8g2_font_helvB12_tr);
   oled.drawStr(0, 63, "S: ");
   x = oled.getStrWidth("S: ") + 4;
@@ -391,7 +460,7 @@ static void drawScreen(float va, float vs) {
   oled.sendBuffer();
 }
 
-// Network status screen: 3 centred lines (Latin only - the _tr fonts have no Cyrillic).
+// Екран стану мережі: 3 рядки по центру (латиниця — _tr не має кирилиці).
 static void drawStatus(const char* l1, const char* l2, const char* l3) {
   if (!oledOk) return;
   oled.clearBuffer();
@@ -415,44 +484,36 @@ static void showError(const char* msg) {
   oled.sendBuffer();
 }
 
-// ----------------------------- Serial commands ------------------------------
+// ----------------------------- Serial-команди -------------------------------
 static void handleSerial(float va) {
   if (!Serial.available()) return;
   char c = (char)Serial.read();
   switch (c) {
-    case 'z':  // autozero A: the present A becomes 0.000
-      offsetA += va;               // va already includes the old offsetA -> add
+    case 'z':  // автонуль A: поточне A стає 0.000
+      offsetA += va;               // va вже містить попередній offsetA -> додаємо
       saveFloat("offA", offsetA);
-      Serial.printf("Autozero A: offsetA=%.5f V\n", offsetA);
+      Serial.printf("Автонуль A: offsetA=%.5f V\n", offsetA);
       break;
-    case 'Z':  // clear the autozero of A
+    case 'Z':  // скинути автонуль A
       offsetA = 0.0f;
       saveFloat("offA", offsetA);
-      Serial.println(F("Autozero A cleared"));
+      Serial.println(F("Автонуль A скинуто"));
       break;
-    case 'r':  // print the calibration
+    case 'r':  // показати калібрування
       Serial.printf("offA=%.5f\n", offsetA);
-      break;
-    case 'v':  // wiring check: AIN1 at ~1.65 V = VMID divider, ~0 V = tied to GND
-      ads.setGain(GAIN_ONE);
-      for (uint8_t ch = 0; ch < 4; ch++) {
-        int32_t acc = 0;
-        for (uint8_t i = 0; i < SAMPLES; i++) acc += ads.readADC_SingleEnded(ch);
-        Serial.printf("AIN%u = %.4f V\n", ch, ads.computeVolts((int16_t)(acc / SAMPLES)));
-      }
       break;
     default:
       break;
   }
 }
 
-// ----------------------------- Web page -------------------------------------
+// ----------------------------- Веб-сторінка ---------------------------------
 static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="uk"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>pH calibrator</title>
+<title>Калібратор pH</title>
 <style>
-/* Palette as on the KH station dashboard: grey background + green accent */
+/* Палітра як на kh-station: сірий фон + зелений акцент */
 :root{
   --bg:#2c2c2c; --card:#3b3b3b; --card2:#333; --line:#555;
   --fg:#fff; --dim:#b9b9b9; --muted:#8d8d8d;
@@ -461,18 +522,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Arial,sans-serif;padding:14px}
-h1{font-size:18px;margin:0}
-.top{display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap}
-.top .ver{font-size:12px;color:var(--muted);margin-left:auto}
-.lang{display:flex;gap:4px}
-.lang button{flex:none;min-width:0;margin:0;padding:2px;line-height:0;background:none;border:1px solid transparent;border-radius:3px;opacity:.4;cursor:pointer}
-.lang button:hover{opacity:.8}
-.lang button.on{opacity:1;border-color:var(--line)}
-.lang svg{display:block;width:21px;height:14px}
-html:not([lang="uk"]) .i-uk{display:none}
-html[lang="uk"] .i-en{display:none}
-.ban{background:#4a3a1c;border:1px solid var(--warn);border-radius:8px;padding:10px 12px;margin:0 0 12px;color:#fff}
-.ban button{margin:0 0 0 8px;padding:6px 10px}
+h1{font-size:18px;margin:0 0 12px}
 h2{font-size:14px;color:var(--dim);margin:18px 0 8px;text-transform:uppercase;letter-spacing:.05em}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
@@ -488,15 +538,15 @@ button.p{border-color:var(--accent);color:var(--accent)}
 button.g{background:var(--card2);color:var(--dim)}
 button:active{transform:translateY(1px)}
 .row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-input,select{background:#2c2c2c;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:8px;width:90px;font-size:14px}
-input.w,select.w{width:220px;max-width:100%}
+input{background:#2c2c2c;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:8px;width:90px;font-size:14px}
 .pt{font-size:13px;color:var(--muted);margin:2px 0}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
 small{color:var(--dim)}
 .graphs{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0}
 .gcol{flex:1 1 300px;min-width:240px;display:flex;flex-direction:column}
 .gcap{font-size:12px;color:var(--dim);margin:0 0 4px}
-.gcanvas{width:100%;height:240px;background:var(--card);border:1px solid var(--line);border-radius:8px;cursor:crosshair;touch-action:none}
+.gcanvas{width:100%;height:240px;background:var(--card);border:1px solid var(--line);border-radius:8px;cursor:crosshair;touch-action:pan-y}
+.rz{font-size:12px;padding:5px 9px;margin:6px 0 0;border-color:var(--warn);color:var(--warn)}
 .block{border:1px solid var(--line);border-radius:10px;padding:2px 14px 16px;margin:16px 0;background:var(--card2)}
 .block>h2:first-child{margin-top:14px;color:var(--accent)}
 h3{font-size:13px;color:var(--dim);margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em}
@@ -509,236 +559,292 @@ h3{font-size:13px;color:var(--dim);margin:16px 0 6px;text-transform:uppercase;le
 .cgrn{color:var(--accent)}
 input[type=checkbox]{width:auto;margin:0 5px 0 0;vertical-align:middle}
 .phwrap{display:flex;flex-direction:column;align-items:flex-start;margin:12px 0}
-#cPh{width:100%;aspect-ratio:1/1;background:var(--card);border:1px solid var(--line);border-radius:8px;cursor:crosshair}
+#cPh{width:100%;flex:1 1 auto;min-height:440px;background:var(--card);border:1px solid var(--line);border-radius:8px;cursor:crosshair}
+.hdr{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.htl{display:flex;align-items:center}
+.lang{display:flex;gap:4px}
+.lang button{margin:0;padding:6px 11px;font-size:13px;min-width:44px}
+.lang button.lsel{border-color:var(--accent);color:var(--accent);font-weight:700}
+.dot{width:11px;height:11px;border-radius:50%;display:inline-block;margin-left:10px;background:var(--muted);transition:background .3s,box-shadow .3s}
+.dot.on{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+.dot.off{background:var(--muted)}
+.seg{font-size:12px;padding:5px 11px;margin:0 4px 0 0}
+.seg.on{border-color:var(--accent);color:var(--accent);font-weight:700}
+.gtog{cursor:pointer;user-select:none}
+.gcol.collapsed .gbody{display:none}
+.gcol.collapsed .car{transform:rotate(-90deg)}
 </style></head><body>
-<div class="top"><h1>pH calibrator</h1><span class="lang" id="lang"><button type="button" data-l="en" title="English" aria-label="English"><svg viewBox="0 0 60 30" preserveAspectRatio="none" aria-hidden="true"><clipPath id="ukS"><path d="M0 0v30h60V0z"/></clipPath><clipPath id="ukT"><path d="M30 15h30v15zv15H0zH0V0zV0h30z"/></clipPath><g clip-path="url(#ukS)"><path d="M0 0v30h60V0z" fill="#012169"/><path d="M0 0l60 30m0-30L0 30" stroke="#fff" stroke-width="6"/><path d="M0 0l60 30m0-30L0 30" clip-path="url(#ukT)" stroke="#C8102E" stroke-width="4"/><path d="M30 0v30M0 15h60" stroke="#fff" stroke-width="10"/><path d="M30 0v30M0 15h60" stroke="#C8102E" stroke-width="6"/></g></svg></button><button type="button" data-l="uk" title="Українська" aria-label="Українська"><svg viewBox="0 0 3 2" aria-hidden="true"><path d="M0 0h3v1H0z" fill="#0057B7"/><path d="M0 1h3v1H0z" fill="#FFD700"/></svg></button></span><span class="ver" id="ver"></span></div>
+<div class="hdr"><div class="htl"><h1 data-t="title">Калібратор pH</h1><span id="online" class="dot off"></span></div>
+  <div class="lang"><button id="lua" class="lsel" onclick="setLang('ua')">UA</button><button id="len" onclick="setLang('en')">EN</button></div></div>
 
-<div class="ban" id="apban" style="display:none">No Wi-Fi network yet: the calibrator runs its own access point.<button class="p" onclick="openWifi()">Wi-Fi setup</button></div>
-
-<h2>Current readings</h2>
+<h2 data-t="h.cur">Поточні покази</h2>
 <div class="grid">
-  <div class="tile"><div class="k">A (simulator)</div><div class="v"><span id="e">–</span> <span class="u">mV</span> · <span class="u">pH</span> <b id="phA" class="camb">–</b></div></div>
-  <div class="tile"><div class="k">S (board output)</div><div class="v"><span id="s">–</span> <span class="u">V</span> · <span class="u">pH</span> <b id="phS" class="cgrn">–</b></div></div>
-  <div class="tile"><div class="k">S noise</div><div class="v"><span id="noise">–</span> <span class="u">mV</span></div></div>
-  <div class="tile"><div class="k">Board current</div><div class="v"><span id="cur">–</span> <span class="u">mA</span></div></div>
-  <div class="tile"><div class="k">Gain (zero <span id="zerot">–</span> V)</div><div class="v"><span id="gaint">–</span> <span class="u">V/V</span></div></div>
+  <div class="tile"><div class="k" data-t="k.A">A (імітатор)</div><div class="v"><span id="e">–</span> <span class="u" data-t="u.mv">мВ</span> · <span class="u" data-t="u.ph">рН</span> <b id="phA" class="camb">–</b></div></div>
+  <div class="tile"><div class="k" data-t="k.S">S (вихід плати, з поправкою шунта)</div><div class="v"><span id="s">–</span> <span class="u" data-t="u.v">В</span> · <span class="u" data-t="u.ph">рН</span> <b id="phS" class="cgrn">–</b></div></div>
+  <div class="tile"><div class="k" data-t="k.sraw">S сире / падіння шунта</div><div class="v"><span id="sraw">–</span> / <span id="sdrop">–</span> <span class="u" data-t="u.v">В</span></div></div>
+  <div class="tile"><div class="k" data-t="k.noise">Шум S</div><div class="v"><span id="noise">–</span> <span class="u" data-t="u.mv">мВ</span></div></div>
+  <div class="tile"><div class="k" data-t="k.cur">Струм плати</div><div class="v"><span id="cur">–</span> <span class="u" data-t="u.ma">мА</span></div></div>
+  <div class="tile"><div class="k" data-t="k.usb">Живлення USB</div><div class="v"><span id="usb">–</span> <span class="u" data-t="u.v">В</span> <button class="g" style="padding:2px 8px;font-size:12px;margin:0 0 0 6px" onclick="calUsb()" data-t="btn.calusb">калібр.</button></div></div>
+  <div class="tile"><div class="k" data-t="k.gaint">Підсилення (нуль <span id="zerot">–</span> В)</div><div class="v"><span id="gaint">–</span> <span class="u" data-t="u.vv">В/В</span></div></div>
 </div>
 
 <section class="block" id="blk1">
-<h2 onclick="togBlk('blk1')"><span class="car">▾</span> Block 1 · Board leakage</h2>
+<h2 onclick="togBlk('blk1')" data-t="h.blk1"><span class="car">▾</span> Блок 1 · Витік плати</h2>
 <div class="bbody">
 <div class="grid">
-  <div class="tile leak"><div class="k">Leakage current</div><div class="v"><span id="il">–</span> <span class="u">nA</span></div></div>
-  <div class="tile"><div class="k">Over the limit (limit <span id="normlbl">–</span> nA)</div><div class="v" id="over">–</div></div>
-  <div class="tile"><div class="k">Board input (calculated)</div><div class="v"><span id="vin">–</span> <span class="u">mV</span></div></div>
+  <div class="tile leak"><div class="k" data-t="k.il">Струм витоку</div><div class="v"><span id="il">–</span> <span class="u" data-t="u.na">нА</span></div></div>
+  <div class="tile"><div class="k" data-t="k.over">Понад норму (норма <span id="normlbl">–</span> нА)</div><div class="v" id="over">–</div></div>
+  <div class="tile"><div class="k" data-t="k.vin">Вхід плати (розрах.)</div><div class="v"><span id="vin">–</span> <span class="u" data-t="u.mv">мВ</span></div></div>
 </div>
-<small id="leakhint">Calibrate with two points below first - the leakage is calculated from them.</small>
+<small id="leakhint" data-t="leakhint">Для розрахунку спершу зробіть калібрування двома точками нижче.</small>
 
-<h3>Calibration (button PRESSED, series resistor shorted)</h3>
-<p class="pt i-en"><b>E</b> is the simulator voltage, the same one shown above as <b>A</b> (in mV); you set it with the trimmer. The pressed button shorts the series resistor (takes it out of the circuit), so the board input gets exactly E - a clean reference point. Release the button to measure the leakage.</p>
-<p class="pt i-uk"><b>E</b> — це напруга імітатора, та сама, що вгорі показана як <b>A</b> (у мВ); ви задаєте її підстроєчним резистором. Натиснута кнопка закорочує послідовний резистор (прибирає його з кола), тож на вхід плати йде рівно E — це дає чисту опорну точку. Для виміру витоку кнопку відпустіть.</p>
-<p class="pt i-en"><b>Step 1.</b> Set some voltage E with the trimmer (watch A above) → «Take point 1».<br>
-<b>Step 2.</b> Set a clearly different E (the farther from the first, the more accurate) → «Take point 2».<br>
-The calibrator draws the board's «E → S» line (gain and zero) and from then on calculates the leakage current.</p>
-<p class="pt i-uk"><b>Крок 1.</b> Виставте резистором якусь напругу E (дивіться на A вгорі) → «Зняти точку 1».<br>
+<h3 data-t="h.calzero">Калібрування (кнопка НАТИСНУТА, 10 МОм закорочено)</h3>
+<p class="pt" data-t="p.e"><b>E</b> — це напруга імітатора, та сама, що вгорі показана як <b>A</b> (у мВ); ви задаєте її підстроєчним резистором. Натиснута кнопка закорочує послідовний резистор 10 МОм (прибирає його з кола), тож на вхід плати йде рівно E — це дає чисту опорну точку. Для виміру витоку кнопку відпустіть.</p>
+<p class="pt" data-t="p.steps"><b>Крок 1.</b> Виставте резистором якусь напругу E (дивіться на A вгорі) → «Зняти точку 1».<br>
 <b>Крок 2.</b> Виставте помітно іншу E (що далі від першої, то точніше) → «Зняти точку 2».<br>
 Прилад побудує пряму «E → S» плати (підсилення і нуль), і після цього рахуватиме струм витоку.</p>
-<div class="pt">Point 1: <span id="p1">—</span></div>
-<div class="pt">Point 2: <span id="p2">—</span></div>
-<div class="pt">Line: gain <b><span id="gain">—</span></b> V/V, zero <b><span id="zero">—</span></b> V — <span id="valid" class="bad">not ready</span></div>
-<div class="pt">With the leakage the input is shifted by <b><span id="leakoff">—</span></b> mV → error <b><span id="leakph">—</span></b> pH (dashed on the chart).</div>
+<div class="pt" data-t="lbl.p1">Точка 1: <span id="p1">—</span></div>
+<div class="pt" data-t="lbl.p2">Точка 2: <span id="p2">—</span></div>
+<div class="pt" data-t="s.line">Пряма: підсилення <b><span id="gain">—</span></b> В/В, нуль <b><span id="zero">—</span></b> В — <span id="valid" class="bad">не готово</span></div>
+<div class="pt" data-t="s.leakoff">З витоком вхід зсунуто на <b><span id="leakoff">—</span></b> мВ → похибка <b><span id="leakph">—</span></b> pH (пунктир на графіку).</div>
 <div class="row">
-  <button class="p" onclick="post('/p1')">Take point 1</button>
-  <button class="p" onclick="post('/p2')">Take point 2</button>
-  <button class="g" onclick="post('/calreset')">Reset calibration</button>
+  <button class="p" onclick="post('/p1')" data-t="btn.p1">Зняти точку 1</button>
+  <button class="p" onclick="post('/p2')" data-t="btn.p2">Зняти точку 2</button>
+  <button class="g" onclick="postC('/calreset','cfm.cal')" data-t="btn.calreset">Скинути калібрування</button>
 </div>
 <div class="row">
-  <label>Resistor R, MΩ:</label>
+  <label data-t="lbl.R">Резистор R, МОм:</label>
   <input id="rin" type="number" step="0.1" min="0.1">
-  <button onclick="setR()">Save R</button>
-  <button class="g" onclick="post('/zeroa')">Autozero A</button>
-  <label>Leakage limit, nA:</label>
+  <button onclick="setR()" data-t="btn.saveR">Зберегти R</button>
+  <button class="g" onclick="post('/zeroa')" data-t="btn.zeroa">Автонуль A</button>
+  <label data-t="lbl.norm">Норма витоку, нА:</label>
   <input id="nin" type="number" step="0.001" min="0.001">
-  <button onclick="setNorm()">Save limit</button>
+  <button onclick="setNorm()" data-t="btn.savenorm">Зберегти норму</button>
 </div>
 
 <div class="graphs">
   <div class="gcol" style="flex:3 1 0">
-    <div class="gcap">Leakage over time, nA (wheel: zoom, drag: pan, double-click: whole history)</div><canvas id="cLeak" class="gcanvas"></canvas>
-    <div class="gcap" style="margin-top:10px">Calibration: E (mV) → S (V)</div><canvas id="cCal" class="gcanvas"></canvas>
+    <div class="gcap" data-t="gcap.leak">Витік у часі, нА (протягни рамку: ширина — зум X, висота — зум Y; щипок на дотику; подвійний клік — скинути)</div><canvas id="cLeak" class="gcanvas"></canvas><button class="rz" id="rz_cLeak" onclick="zoomReset('cLeak')" data-t="btn.rz" hidden>скинути зум</button>
+    <div class="gcap" style="margin-top:10px" data-t="gcap.cal">Калібрування: E (мВ) → S (В)</div><canvas id="cCal" class="gcanvas"></canvas>
   </div>
   <div class="gcol" style="flex:2 1 0;max-width:420px">
-    <div class="gcap">pH: reading vs true — green without leakage, dashed with leakage</div><canvas id="cPh"></canvas>
+    <div class="gcap" data-t="gcap.ph">pH: показ vs справжній — зелена без витоку, пунктир з витоком</div><canvas id="cPh"></canvas>
   </div>
 </div>
 </div>
 </section>
 
 <section class="block" id="blk2">
-<h2 onclick="togBlk('blk2')"><span class="car">▾</span> Block 2 · Electrode and pH</h2>
+<h2 onclick="togBlk('blk2')" data-t="h.blk2"><span class="car">▾</span> Блок 2 · Електрод і рН</h2>
 <div class="bbody">
-<div class="graphs"><div class="gcol"><div class="gcap">Reference pH (A, simulator) over time (wheel: zoom, drag: pan, double-click: whole history)</div><canvas id="cPhA" class="gcanvas"></canvas></div></div>
-<div class="graphs"><div class="gcol"><div class="gcap"><span class="i-en">Real pH (S, board/electrode) over time — <b style="color:var(--accent)">pH</b> (left axis) + <b style="color:var(--blue)">S voltage, V</b> (right axis). wheel: zoom, drag: pan, double-click: all</span><span class="i-uk">рН реальний (S, плата/електрод) у часі — <b style="color:var(--accent)">рН</b> (ліва вісь) + <b style="color:var(--blue)">напруга S, В</b> (права вісь). коліщатко: зум, тягнути: зсув, 2× клік: усе</span></div><canvas id="cPhS" class="gcanvas"></canvas></div></div>
+<div class="graphs"><div class="gcol" id="gcPhA"><div class="gcap gtog" onclick="togGraph('gcPhA')"><span class="car">▾</span> <span data-t="gcap.phA">рН опорний (A, імітатор) у часі (протягни рамку: ширина — зум X, висота — зум Y; щипок; подвійний клік — скинути)</span></div><div class="gbody"><canvas id="cPhA" class="gcanvas"></canvas><button class="rz" id="rz_cPhA" onclick="zoomReset('cPhA')" data-t="btn.rz" hidden>скинути зум</button></div></div></div>
+<div class="row"><button class="p" onclick="measStart()" data-t="btn.meas">Почати вимір</button>
+  <span class="hint" data-t="hint.meas">після калібрування — чистий pH від цієї мітки (калібрувальні занурення не показуються); до калібрування показується напруга S</span></div>
+<div class="graphs"><div class="gcol"><div class="gcap" id="cPhSCap">рН реальний · вимір</div>
+<div class="row" style="margin:2px 0 6px"><span class="hint" data-t="lbl.show">будувати:</span><button class="seg on" id="sg_ph" onclick="setPhSMode('ph')" data-t="seg.ph">рН</button><button class="seg" id="sg_sv" onclick="setPhSMode('sv')" data-t="seg.sv">S, В</button><button class="seg" id="sg_mv" onclick="setPhSMode('mv')" data-t="seg.mv">мВ електрода</button></div>
+<canvas id="cPhS" class="gcanvas"></canvas><button class="rz" id="rz_cPhS" onclick="zoomReset('cPhS')" data-t="btn.rz" hidden>скинути зум</button></div></div>
 
-<h3>Electrode equilibrium</h3>
-<p class="pt i-en">How fast the pH settles after the electrode is dipped or the solution changes. The guide is the <b>real pH</b> (from S). Press «Start» right after dipping; the calibrator watches the drift and declares equilibrium once the swing over 10 seconds falls inside the quiet band.</p>
-<p class="pt i-uk">Як швидко встановлюється рН після занурення електрода або зміни розчину. Орієнтир — <b>рН реальний</b> (з S). Натисніть «Старт» одразу після занурення; прилад стежить за дрейфом і оголошує рівновагу, коли коливання за 10 секунд спадуть у межі смуги спокою.</p>
+<h3 data-t="h.bufcal">Калібрування електрода (3 буфери)</h3>
+<p class="pt" data-t="p.bufcal">Відображає вихід плати у <b>справжній pH</b> за трьома буферами (двосегментно: кислий 4–7, лужний 7–9). Передумови: вгорі має бути готове калібрування плати (пряма E→S), і плата живлена від робочого джерела. Занурте електрод у буфер, дочекайтесь рівноваги (нижче) → зніміть точку.</p>
 <div class="row">
-  <button class="p" onclick="eqStart()">Start</button>
-  <button class="g" onclick="eqStop()">Stop</button>
-  <label>Quiet band, pH:</label>
-  <input id="eqband" type="number" step="0.005" min="0.005" value="0.02">
-  <button class="g" onclick="selStart()">Pick limits on the chart</button>
+  <label data-t="lbl.bt">Температура буферів, °C:</label>
+  <input id="btin" type="number" step="0.5" value="25">
+  <button class="g" onclick="setTemp()" data-t="btn.setT">Застосувати T</button>
+  <span class="hint" data-t="hint.bt">поправляє номінали (особливо лужний 9,18)</span>
 </div>
-<p class="hint i-en">Also, without waiting: press «Pick limits on the chart» and click the <b>start</b> and the <b>end</b> of the transient on the «real pH» chart - the calibrator works out the time, drift, t63 and equilibrium pH for exactly that stretch.</p>
-<p class="hint i-uk">Додатково, без очікування: натисніть «Обрати межі на графіку» і клікніть на графіку «рН реальний» <b>початок</b> і <b>кінець</b> перехідного процесу — прилад порахує час, дрейф, t63 і рівноважний рН саме за цим відрізком.</p>
 <div class="grid">
-  <div class="tile"><div class="k">State</div><div class="v" id="eqstate">—</div></div>
-  <div class="tile"><div class="k">Time since start</div><div class="v"><span id="eqt">—</span> <span class="u">s</span></div></div>
-  <div class="tile"><div class="k">Drift over 10 s</div><div class="v"><span id="eqdrift">—</span> <span class="u">pH</span></div></div>
-  <div class="tile"><div class="k">Time to equilibrium</div><div class="v"><span id="eqset">—</span> <span class="u">s</span></div></div>
-  <div class="tile"><div class="k">t63 (time constant)</div><div class="v"><span id="eqt63">—</span> <span class="u">s</span></div></div>
-  <div class="tile"><div class="k">Equilibrium pH</div><div class="v" id="eqph">—</div></div>
+  <div class="tile"><div class="k"><span data-t="k.buf0">pH 4,01 · кислий</span> <span id="pc0" class="u"></span></div><div class="v"><span id="bv0">–</span> <span class="u" data-t="u.mv">мВ</span> <b id="bs0" class="camb">–</b></div></div>
+  <div class="tile"><div class="k"><span data-t="k.buf1">pH 6,86 · середній</span> <span id="pc1" class="u"></span></div><div class="v"><span id="bv1">–</span> <span class="u" data-t="u.mv">мВ</span> <b id="bs1" class="camb">–</b></div></div>
+  <div class="tile"><div class="k"><span data-t="k.buf2">pH 9,18 · лужний</span> <span id="pc2" class="u"></span></div><div class="v"><span id="bv2">–</span> <span class="u" data-t="u.mv">мВ</span> <b id="bs2" class="camb">–</b></div></div>
+</div>
+<div class="row">
+  <button class="p" onclick="post('/bufcap?i=0')" data-t="btn.cap0">Зняти 4,01</button>
+  <button class="p" onclick="post('/bufcap?i=1')" data-t="btn.cap1">Зняти 6,86</button>
+  <button class="p" onclick="post('/bufcap?i=2')" data-t="btn.cap2">Зняти 9,18</button>
+  <button class="g" onclick="postC('/bufclr','cfm.buf')" data-t="btn.bufclr">Скинути</button>
+</div>
+<div class="grid">
+  <div class="tile"><div class="k" data-t="k.state">Стан</div><div class="v" id="pcstate">–</div></div>
+  <div class="tile"><div class="k" data-t="k.slopeA">Нахил кислий</div><div class="v"><span id="psa">–</span> <span class="u">%</span></div></div>
+  <div class="tile"><div class="k" data-t="k.slopeB">Нахил лужний</div><div class="v"><span id="psb">–</span> <span class="u">%</span></div></div>
+  <div class="tile"><div class="k" data-t="k.off7">Зсув при pH7</div><div class="v"><span id="pof">–</span> <span class="u" data-t="u.mv">мВ</span></div></div>
+</div>
+<p class="hint" data-t="hint.health">Добрий електрод: нахил <b>92–103 %</b>, зсув <b>&lt; ±30 мВ</b>. Поза цим — мити/міняти. Коли калібрування готове, «рН реальний» рахується за буферами (інакше — ідеальний Нернст).</p>
+<div class="gcap" data-t="gcap.calph">Калібрування електрода: pH → мВ — <b style="color:var(--accent)">вимір</b> (двосегментно) vs <b style="color:var(--warn)">ідеал Нернста −59,16</b></div>
+<canvas id="cCalPh" class="gcanvas" style="height:300px;cursor:default"></canvas>
+
+<h3 data-t="h.eq">Рівновага електрода</h3>
+<p class="pt" data-t="p.eq">Як швидко встановлюється рН після занурення електрода або зміни розчину. Орієнтир — <b>рН реальний</b> (з S). Натисніть «Старт» одразу після занурення; прилад стежить за дрейфом і оголошує рівновагу, коли коливання за 10 секунд спадуть у межі смуги спокою.</p>
+<div class="row">
+  <button class="p" onclick="eqStart()" data-t="btn.eqstart">Старт</button>
+  <button class="g" onclick="eqStop()" data-t="btn.eqstop">Стоп</button>
+  <label data-t="lbl.eqband">Смуга спокою, рН:</label>
+  <input id="eqband" type="number" step="0.005" min="0.005" value="0.02">
+  <button class="g" onclick="selStart()" data-t="btn.sel">Обрати межі на графіку</button>
+</div>
+<p class="hint" data-t="hint.eq2">Додатково, без очікування: натисніть «Обрати межі на графіку» і клікніть на графіку «рН реальний» <b>початок</b> і <b>кінець</b> перехідного процесу — прилад порахує час, дрейф, t63 і рівноважний рН саме за цим відрізком.</p>
+<div class="grid">
+  <div class="tile"><div class="k" data-t="k.state">Стан</div><div class="v" id="eqstate">—</div></div>
+  <div class="tile"><div class="k" data-t="k.eqt">Час від старту</div><div class="v"><span id="eqt">—</span> <span class="u" data-t="u.s">с</span></div></div>
+  <div class="tile"><div class="k" data-t="k.eqdrift">Дрейф за 10 с</div><div class="v"><span id="eqdrift">—</span> <span class="u" data-t="u.ph">рН</span></div></div>
+  <div class="tile"><div class="k" data-t="k.eqset">Час до рівноваги</div><div class="v"><span id="eqset">—</span> <span class="u" data-t="u.s">с</span></div></div>
+  <div class="tile"><div class="k" data-t="k.eqt63">t63 (стала часу)</div><div class="v"><span id="eqt63">—</span> <span class="u" data-t="u.s">с</span></div></div>
+  <div class="tile"><div class="k" data-t="k.eqph">Рівноважний рН</div><div class="v" id="eqph">—</div></div>
 </div>
 
-<h3>Data and drift</h3>
-<p class="hint i-en">The history lives <b>in the browser, not in the calibrator's flash</b>: 1 point/s, a buffer for ~14 h (a night). Do not close the tab or let the computer sleep. The data is also kept in the browser's storage and survives a page reload. For an archive press «Download CSV».</p>
-<p class="hint i-uk">Історія живе <b>у браузері, не у флеші приладу</b>: запис 1 точка/с, буфер на ~14 год (ніч). Не закривайте вкладку і не давайте компʼютеру заснути. Дані ще й самі осідають у памʼяті браузера і переживають перезавантаження сторінки. Для архіву натисніть «Завантажити CSV».</p>
+<h3 data-t="h.data">Дані і дрейф</h3>
+<p class="hint" data-t="hint.data">Історія живе <b>у браузері, не у флеші приладу</b>: запис 1 точка/с, буфер на ~14 год (ніч). Не закривайте вкладку і не давайте компʼютеру заснути. Дані ще й самі осідають у памʼяті браузера і переживають перезавантаження сторінки. Для архіву натисніть «Завантажити CSV».</p>
 <div class="row">
-  <button class="p" onclick="expCsv()">Download CSV</button>
-  <button class="g" onclick="clrLog()">Clear history</button>
-  <span class="hint">points in memory: <b id="npts">0</b></span>
+  <button class="g" id="pauseBtn" onclick="togPause()">Пауза</button>
+  <button class="p" onclick="expCsv()" data-t="btn.csv">Завантажити CSV</button>
+  <button class="g" onclick="if(confirm(T('cfm.hist')))clrLog()" data-t="btn.clr">Очистити історію</button>
+  <span class="hint"><span data-t="hint.npts">точок у памʼяті:</span> <b id="npts">0</b></span>
 </div>
-</div>
-</section>
-
-<section class="block" id="blk3">
-<h2 onclick="togBlk('blk3')"><span class="car">▾</span> Wi-Fi</h2>
-<div class="bbody">
-<div class="pt" id="wst">–</div>
-<div class="row">
-  <button class="g" onclick="scanWifi()">Find networks</button>
-  <select id="wlist" class="w" onchange="if(this.value)document.getElementById('wssid').value=this.value"></select>
-</div>
-<div class="row">
-  <label>Network (SSID):</label>
-  <input id="wssid" class="w" maxlength="32" autocomplete="off">
-  <label>Password:</label>
-  <input id="wpass" class="w" type="password" maxlength="63" autocomplete="new-password">
-</div>
-<div class="row">
-  <button class="p" onclick="saveWifi()">Save and restart</button>
-  <button class="g" onclick="forgetWifi()">Forget the network</button>
-</div>
-<p class="hint i-en">The calibrator restarts and joins the network; the page is then at <b>http://calibrator.local/</b> (or the IP shown on the screen). If it cannot connect within 20 s it brings up its own access point <b>pH-Calibrator</b> (password <b>calib1234</b>) again, with the page at <b>http://192.168.4.1/</b>. Only 2.4 GHz networks. An empty password means an open network.</p>
-<p class="hint i-uk">Прилад перезапуститься і під'єднається до мережі; сторінка тоді за адресою <b>http://calibrator.local/</b> (або IP з екрана). Якщо за 20 с під'єднатися не вдасться, він знову підніме власну точку доступу <b>pH-Calibrator</b> (пароль <b>calib1234</b>), сторінка — <b>http://192.168.4.1/</b>. Лише мережі 2.4 ГГц. Порожній пароль — відкрита мережа.</p>
 </div>
 </section>
 
 <script>
-// --- Language, EN / UA - the same mechanism as the KH station dashboard.
-// Short labels: each text node remembers its English original and is translated through
-// the UA dictionary. Strings with numbers go through T() with {0} placeholders. Long
-// paragraphs with markup have two copies (.i-en / .i-uk) and CSS shows one. What the
-// DEVICE says (server replies, Serial) stays English. The choice is per browser; the
-// first visit follows the browser's language.
-const UA={
-'pH calibrator':'Калібратор pH','Current readings':'Поточні покази','A (simulator)':'A (імітатор)','S (board output)':'S (вихід плати)',
-'S noise':'Шум S','Board current':'Струм плати','Gain (zero':'Підсилення (нуль','V)':'В)',
-'mV':'мВ','V':'В','nA':'нА','mA':'мА','s':'с','pH':'рН','V/V':'В/В',
-'No Wi-Fi network yet: the calibrator runs its own access point.':'Мережу Wi-Fi ще не задано: прилад працює як власна точка доступу.',
-'Wi-Fi setup':'Налаштувати Wi-Fi',
-'Block 1 · Board leakage':'Блок 1 · Витік плати','Leakage current':'Струм витоку','Over the limit (limit':'Понад норму (норма','nA)':'нА)',
-'Board input (calculated)':'Вхід плати (розрах.)',
-'Calibrate with two points below first - the leakage is calculated from them.':'Для розрахунку спершу зробіть калібрування двома точками нижче.',
-'Calibration (button PRESSED, series resistor shorted)':'Калібрування (кнопка НАТИСНУТА, послідовний резистор закорочено)',
-'Point 1:':'Точка 1:','Point 2:':'Точка 2:','Line: gain':'Пряма: підсилення','V/V, zero':'В/В, нуль','V —':'В —',
-'not ready':'не готово','ready':'готово',
-'With the leakage the input is shifted by':'З витоком вхід зсунуто на','mV → error':'мВ → похибка','pH (dashed on the chart).':'pH (пунктир на графіку).',
-'Take point 1':'Зняти точку 1','Take point 2':'Зняти точку 2','Reset calibration':'Скинути калібрування',
-'Resistor R, MΩ:':'Резистор R, МОм:','Save R':'Зберегти R','Autozero A':'Автонуль A','Leakage limit, nA:':'Норма витоку, нА:','Save limit':'Зберегти норму',
-'Leakage over time, nA (wheel: zoom, drag: pan, double-click: whole history)':'Витік у часі, нА (коліщатко: зум, тягнути: зсув, подвійний клік: уся історія)',
-'Calibration: E (mV) → S (V)':'Калібрування: E (мВ) → S (В)',
-'pH: reading vs true — green without leakage, dashed with leakage':'pH: показ vs справжній — зелена без витоку, пунктир з витоком',
-'Block 2 · Electrode and pH':'Блок 2 · Електрод і рН',
-'Reference pH (A, simulator) over time (wheel: zoom, drag: pan, double-click: whole history)':'рН опорний (A, імітатор) у часі (коліщатко: зум, тягнути: зсув, подвійний клік: уся історія)',
-'Electrode equilibrium':'Рівновага електрода','Start':'Старт','Stop':'Стоп','Quiet band, pH:':'Смуга спокою, рН:','Pick limits on the chart':'Обрати межі на графіку',
-'State':'Стан','Time since start':'Час від старту','Drift over 10 s':'Дрейф за 10 с','Time to equilibrium':'Час до рівноваги',
-'t63 (time constant)':'t63 (стала часу)','Equilibrium pH':'Рівноважний рН',
-'Data and drift':'Дані і дрейф','Download CSV':'Завантажити CSV','Clear history':'Очистити історію','points in memory:':'точок у памʼяті:',
-'within the limit':'в нормі','×{0} over':'×{0} понад','E={0} mV, S={1} V':'E={0} мВ, S={1} В',
-'settling…':'стабілізується…','equilibrium':'рівновага','stopped':'зупинено','equilibrium (manual)':'рівновага (вручну)',
-'click the START on the real pH chart':'клікніть ПОЧАТОК на графіку рН реальний','now click the END':'тепер клікніть КІНЕЦЬ',
-'too few points in the selected window':'замало точок у вибраному вікні',
-'waiting for calibration…':'чекаю калібрування…','waiting for data…':'чекаю дані…','no points in the window':'нема точок у вікні',
-'pH reading':'pH показ','pH true':'pH справжній','true {0}':'справж {0}','reading {0}':'показ {0}','zoom':'зум',
-'start':'початок','end':'кінець','{0} s':'{0} с','{0} s from the start':'{0} с від початку',
-'Find networks':'Знайти мережі','Network (SSID):':'Мережа (SSID):','Password:':'Пароль:','Save and restart':'Зберегти і перезапустити',
-'Forget the network':'Забути мережу','searching…':'шукаю…','— choose a network —':'— оберіть мережу —','no networks found':'мереж не знайдено',', open':', відкрита',
-'Connected to «{0}» · {1} · signal {2} dBm':'Під\'єднано до «{0}» · {1} · сигнал {2} dBm',
-'Access point «{0}» · {1} · could not connect to «{2}»':'Точка доступу «{0}» · {1} · не вдалося під\'єднатися до «{2}»',
-'Access point «{0}» · {1} · no network saved':'Точка доступу «{0}» · {1} · мережу не задано',
-'Connecting to «{0}»…':'Під\'єднуюсь до «{0}»…',
-'Enter the network name (1-32 characters).':'Введіть назву мережі (1-32 символи).',
-'The password is 8-63 characters, or empty for an open network.':'Пароль — 8-63 символи, або порожній для відкритої мережі.',
-'Save «{0}» and restart the calibrator?':'Зберегти «{0}» і перезапустити прилад?',
-'Forget the saved network and restart as an access point?':'Забути збережену мережу і перезапуститися точкою доступу?',
-'Restarting… reconnect in ~20 s.':'Перезапуск… під\'єднайтеся знову за ~20 с.'
-};
-let LANG='en';
-{ const auto=(navigator.language||'').toLowerCase().startsWith('uk')?'uk':'en';
-  let l=null; try{ l=localStorage.getItem('lang'); }catch(e){}
-  LANG=(l==='uk'||l==='en')?l:auto; }
-function T(s,...a){ let r=(LANG==='uk'&&UA[s]!==undefined)?UA[s]:s;
-  a.forEach((x,i)=>{ r=r.split('{'+i+'}').join(x); }); return r; }
-// Never translated: the two-language paragraphs, network names, the version.
-const I18N_SKIP='.i-en,.i-uk,#wst,#wlist,#ver,script,style';
-const ORIG=new WeakMap();
-function trNode(n){
-  const p=n.parentElement; if(!p||p.closest(I18N_SKIP)) return;
-  let o=ORIG.get(n); const cur=n.nodeValue;
-  if(!o||cur!==o.shown) o={en:cur};            // text the page has just written is the English original
-  const m=o.en.match(/^(\s*)([\s\S]*?)(\s*)$/), key=m[2].replace(/\s+/g,' ');
-  const tr=(LANG==='uk'&&key&&UA[key]!==undefined)?m[1]+UA[key]+m[3]:o.en;
-  o.shown=tr; ORIG.set(n,o);
-  if(cur!==tr) n.nodeValue=tr;
-}
-function trTree(root){ const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT); let n; while((n=w.nextNode())) trNode(n); }
-const i18nMo=new MutationObserver(recs=>{
-  i18nMo.disconnect();
-  recs.forEach(r=>{ if(r.type==='characterData') trNode(r.target);
-    else r.addedNodes.forEach(n=>{ if(n.nodeType===3) trNode(n); else if(n.nodeType===1) trTree(n); }); });
-  i18nObserve();
-});
-function i18nObserve(){ i18nMo.observe(document.body,{subtree:true,childList:true,characterData:true}); }
-function setLang(l){ LANG=l; try{ localStorage.setItem('lang',l); }catch(e){} applyLang(); relang(); }
+// --- Двомовний інтерфейс (UA/EN). Статичні елементи мають data-t; динамічні рядки йдуть через T(). ---
+const L={ua:{
+ 'title':'Калібратор pH','h.cur':'Поточні покази',
+ 'k.A':'A (імітатор)','k.S':'S (вихід плати, з поправкою шунта)','k.sraw':'S сире / падіння шунта','k.noise':'Шум S','k.cur':'Струм плати',
+ 'k.usb':'Живлення USB','btn.calusb':'калібр.','pr.usb':'Справжня напруга USB, В (виміряй тестером):',
+ 'k.gaint':'Підсилення (нуль <span id="zerot">–</span> В)',
+ 'h.blk1':'<span class="car">▾</span> Блок 1 · Витік плати',
+ 'k.il':'Струм витоку','k.over':'Понад норму (норма <span id="normlbl">–</span> нА)','k.vin':'Вхід плати (розрах.)',
+ 'leakhint':'Для розрахунку спершу зробіть калібрування двома точками нижче.',
+ 'h.calzero':'Калібрування (кнопка НАТИСНУТА, 10 МОм закорочено)',
+ 'p.e':'<b>E</b> — це напруга імітатора, та сама, що вгорі показана як <b>A</b> (у мВ); ви задаєте її підстроєчним резистором. Натиснута кнопка закорочує послідовний резистор 10 МОм (прибирає його з кола), тож на вхід плати йде рівно E — це дає чисту опорну точку. Для виміру витоку кнопку відпустіть.',
+ 'p.steps':'<b>Крок 1.</b> Виставте резистором якусь напругу E (дивіться на A вгорі) → «Зняти точку 1».<br><b>Крок 2.</b> Виставте помітно іншу E (що далі від першої, то точніше) → «Зняти точку 2».<br>Прилад побудує пряму «E → S» плати (підсилення і нуль), і після цього рахуватиме струм витоку.',
+ 'lbl.p1':'Точка 1: <span id="p1">—</span>','lbl.p2':'Точка 2: <span id="p2">—</span>',
+ 's.line':'Пряма: підсилення <b><span id="gain">—</span></b> В/В, нуль <b><span id="zero">—</span></b> В — <span id="valid" class="bad">не готово</span>',
+ 's.leakoff':'З витоком вхід зсунуто на <b><span id="leakoff">—</span></b> мВ → похибка <b><span id="leakph">—</span></b> pH (пунктир на графіку).',
+ 'btn.p1':'Зняти точку 1','btn.p2':'Зняти точку 2','btn.calreset':'Скинути калібрування',
+ 'lbl.R':'Резистор R, МОм:','btn.saveR':'Зберегти R','btn.zeroa':'Автонуль A','lbl.norm':'Норма витоку, нА:','btn.savenorm':'Зберегти норму',
+ 'gcap.leak':'Витік у часі, нА (протягни рамку: ширина — зум X, висота — зум Y; щипок на дотику; подвійний клік — скинути)',
+ 'gcap.cal':'Калібрування: E (мВ) → S (В)','gcap.ph':'pH: показ vs справжній — зелена без витоку, пунктир з витоком','btn.rz':'скинути зум',
+ 'h.blk2':'<span class="car">▾</span> Блок 2 · Електрод і рН',
+ 'gcap.phA':'рН опорний (A, імітатор) у часі (протягни рамку: ширина — зум X, висота — зум Y; щипок; подвійний клік — скинути)',
+ 'btn.meas':'Почати вимір',
+ 'hint.meas':'після калібрування — чистий pH від цієї мітки (калібрувальні занурення не показуються); до калібрування показується напруга S',
+ 'h.bufcal':'Калібрування електрода (3 буфери)',
+ 'p.bufcal':'Відображає вихід плати у <b>справжній pH</b> за трьома буферами (двосегментно: кислий 4–7, лужний 7–9). Передумови: вгорі має бути готове калібрування плати (пряма E→S), і плата живлена від робочого джерела. Занурте електрод у буфер, дочекайтесь рівноваги (нижче) → зніміть точку.',
+ 'lbl.bt':'Температура буферів, °C:','btn.setT':'Застосувати T','hint.bt':'поправляє номінали (особливо лужний 9,18)',
+ 'k.buf0':'pH 4,01 · кислий','k.buf1':'pH 6,86 · середній','k.buf2':'pH 9,18 · лужний',
+ 'btn.cap0':'Зняти 4,01','btn.cap1':'Зняти 6,86','btn.cap2':'Зняти 9,18','btn.bufclr':'Скинути',
+ 'k.state':'Стан','k.slopeA':'Нахил кислий','k.slopeB':'Нахил лужний','k.off7':'Зсув при pH7',
+ 'hint.health':'Добрий електрод: нахил <b>92–103 %</b>, зсув <b>&lt; ±30 мВ</b>. Поза цим — мити/міняти. Коли калібрування готове, «рН реальний» рахується за буферами (інакше — ідеальний Нернст).',
+ 'gcap.calph':'Калібрування електрода: pH → мВ — <b style="color:var(--accent)">вимір</b> (двосегментно) vs <b style="color:var(--warn)">ідеал Нернста −59,16</b>',
+ 'h.eq':'Рівновага електрода',
+ 'p.eq':'Як швидко встановлюється рН після занурення електрода або зміни розчину. Орієнтир — <b>рН реальний</b> (з S). Натисніть «Старт» одразу після занурення; прилад стежить за дрейфом і оголошує рівновагу, коли коливання за 10 секунд спадуть у межі смуги спокою.',
+ 'btn.eqstart':'Старт','btn.eqstop':'Стоп','lbl.eqband':'Смуга спокою, рН:','btn.sel':'Обрати межі на графіку',
+ 'hint.eq2':'Додатково, без очікування: натисніть «Обрати межі на графіку» і клікніть на графіку «рН реальний» <b>початок</b> і <b>кінець</b> перехідного процесу — прилад порахує час, дрейф, t63 і рівноважний рН саме за цим відрізком.',
+ 'k.eqt':'Час від старту','k.eqdrift':'Дрейф за 10 с','k.eqset':'Час до рівноваги','k.eqt63':'t63 (стала часу)','k.eqph':'Рівноважний рН',
+ 'h.data':'Дані і дрейф',
+ 'hint.data':'Історія живе <b>у браузері, не у флеші приладу</b>: запис 1 точка/с, буфер на ~14 год (ніч). Не закривайте вкладку і не давайте компʼютеру заснути. Дані ще й самі осідають у памʼяті браузера і переживають перезавантаження сторінки. Для архіву натисніть «Завантажити CSV».',
+ 'btn.csv':'Завантажити CSV','btn.clr':'Очистити історію','hint.npts':'точок у памʼяті:','u.ph':'рН',
+ // динамічні
+ 'valid.ready':'готово','valid.notready':'не готово','over.ok':'в нормі','over.over':' понад',
+ 'pc.ok':'готово · електрод ОК','pc.check':'готово · перевір електрод','pc.notready':'не готово',
+ 'wait.cal':'чекаю калібрування…','wait.data':'чекаю дані…','nowin':'нема точок у вікні','zoom':'зум',
+ 'ph.shown':'pH показ','ph.true':'pH справжній','hv.true':'справж ','hv.shown':'показ ',
+ 'mk.eq':'рівновага','mk.start':'початок','mk.end':'кінець','fromStart':' с від початку',
+ 'u.na':'нА','u.v':'В','u.mv':'мВ','u.ma':'мА','u.vv':'В/В','u.s':'с','ax.s':' с',
+ 'cap.calib':'рН реальний (калібрований) · вимір','cap.mark':' (від мітки)','cap.ideal':'рН реальний (ідеал. Нернст) · вимір','cap.volt':'напруга S (В) — рН буде після калібрування плати',
+ 'calph.notready':'калібрування буферами ще не готове','calph.acid':'кислий ','calph.alk':'лужний ','calph.off1':'зсув ','calph.off2':' мВ @pH7',
+ 'eq.stab':'стабілізується…','eq.eq':'рівновага','eq.stopped':'зупинено','eq.clickStart':'клікніть ПОЧАТОК на графіку рН реальний','eq.clickEnd':'тепер клікніть КІНЕЦЬ','eq.fewpts':'замало точок у вибраному вікні','eq.eqManual':'рівновага (вручну)',
+ 'on.live':'плата відповідає','on.dead':'нема відповіді',
+ 'lbl.show':'будувати:','seg.ph':'рН','seg.sv':'S, В','seg.mv':'мВ електрода',
+ 'cap.svmeas':'напруга S (В) · вимір','cap.mvmeas':'вхід електрода (мВ) · вимір',
+ 'cfm.cal':'Скинути калібрування плати (точки E→S)?','cfm.buf':'Скинути калібрування електрода (3 буфери)?','cfm.hist':'Очистити всю історію графіків?',
+ 'btn.pause':'Пауза','btn.resume':'Відновити'
+},en:{
+ 'title':'pH Calibrator','h.cur':'Current readings',
+ 'k.A':'A (imitator)','k.S':'S (board output, shunt corrected)','k.sraw':'S raw / shunt drop','k.noise':'S noise','k.cur':'Board current',
+ 'k.usb':'USB supply','btn.calusb':'cal','pr.usb':'True USB voltage, V (measure with a meter):',
+ 'k.gaint':'Gain (zero <span id="zerot">–</span> V)',
+ 'h.blk1':'<span class="car">▾</span> Block 1 · Board leakage',
+ 'k.il':'Leakage current','k.over':'Above norm (norm <span id="normlbl">–</span> nA)','k.vin':'Board input (calc.)',
+ 'leakhint':'First do the two-point calibration below to enable the calculation.',
+ 'h.calzero':'Calibration (button PRESSED, 10 MΩ shorted)',
+ 'p.e':'<b>E</b> is the imitator voltage — the same one shown above as <b>A</b> (in mV); you set it with the trimmer. The pressed button shorts out the 10 MΩ series resistor (removes it from the circuit), so exactly E reaches the board input — a clean reference point. Release the button to measure leakage.',
+ 'p.steps':'<b>Step 1.</b> Set some voltage E with the trimmer (watch A above) → “Capture point 1”.<br><b>Step 2.</b> Set a noticeably different E (the farther from the first, the better) → “Capture point 2”.<br>The device builds the board’s “E → S” line (gain and zero), after which it computes the leakage current.',
+ 'lbl.p1':'Point 1: <span id="p1">—</span>','lbl.p2':'Point 2: <span id="p2">—</span>',
+ 's.line':'Line: gain <b><span id="gain">—</span></b> V/V, zero <b><span id="zero">—</span></b> V — <span id="valid" class="bad">not ready</span>',
+ 's.leakoff':'With leakage the input is shifted by <b><span id="leakoff">—</span></b> mV → error <b><span id="leakph">—</span></b> pH (dashed on the graph).',
+ 'btn.p1':'Capture point 1','btn.p2':'Capture point 2','btn.calreset':'Reset calibration',
+ 'lbl.R':'Resistor R, MΩ:','btn.saveR':'Save R','btn.zeroa':'Auto-zero A','lbl.norm':'Leak norm, nA:','btn.savenorm':'Save norm',
+ 'gcap.leak':'Leakage over time, nA (drag a box: width zooms X, height zooms Y; pinch on touch; double-click to reset)',
+ 'gcap.cal':'Calibration: E (mV) → S (V)','gcap.ph':'pH: shown vs true — green without leak, dashed with leak','btn.rz':'reset zoom',
+ 'h.blk2':'<span class="car">▾</span> Block 2 · Electrode & pH',
+ 'gcap.phA':'Reference pH (A, imitator) over time (drag a box: width zooms X, height zooms Y; pinch; double-click to reset)',
+ 'btn.meas':'Start measurement',
+ 'hint.meas':'after calibration — clean pH from this mark (calibration dips are not shown); before calibration voltage S is shown',
+ 'h.bufcal':'Electrode calibration (3 buffers)',
+ 'p.bufcal':'Maps the board output to <b>true pH</b> using three buffers (two-segment: acid 4–7, alkaline 7–9). Prerequisites: the board calibration above must be ready (the E→S line) and the board powered from its working supply. Immerse the electrode in a buffer, wait for equilibrium (below) → capture the point.',
+ 'lbl.bt':'Buffer temperature, °C:','btn.setT':'Apply T','hint.bt':'corrects the nominal values (especially alkaline 9.18)',
+ 'k.buf0':'pH 4.01 · acid','k.buf1':'pH 6.86 · middle','k.buf2':'pH 9.18 · alkaline',
+ 'btn.cap0':'Capture 4.01','btn.cap1':'Capture 6.86','btn.cap2':'Capture 9.18','btn.bufclr':'Reset',
+ 'k.state':'State','k.slopeA':'Acid slope','k.slopeB':'Alkaline slope','k.off7':'Offset at pH7',
+ 'hint.health':'A good electrode: slope <b>92–103 %</b>, offset <b>&lt; ±30 mV</b>. Outside that — clean/replace it. When calibration is ready, “Real pH” is computed from the buffers (otherwise — ideal Nernst).',
+ 'gcap.calph':'Electrode calibration: pH → mV — <b style="color:var(--accent)">measured</b> (two-segment) vs <b style="color:var(--warn)">ideal Nernst −59.16</b>',
+ 'h.eq':'Electrode equilibrium',
+ 'p.eq':'How fast pH settles after immersing the electrode or changing the solution. Reference — <b>Real pH</b> (from S). Press “Start” right after immersion; the device tracks drift and declares equilibrium when the swing over 10 seconds falls within the settle band.',
+ 'btn.eqstart':'Start','btn.eqstop':'Stop','lbl.eqband':'Settle band, pH:','btn.sel':'Pick bounds on the graph',
+ 'hint.eq2':'Alternatively, without waiting: press “Pick bounds on the graph” and click the <b>start</b> and <b>end</b> of the transient on the “Real pH” graph — the device computes time, drift, t63 and the equilibrium pH for exactly that segment.',
+ 'k.eqt':'Time from start','k.eqdrift':'Drift over 10 s','k.eqset':'Time to equilibrium','k.eqt63':'t63 (time constant)','k.eqph':'Equilibrium pH',
+ 'h.data':'Data & drift',
+ 'hint.data':'The history lives <b>in the browser, not in the device flash</b>: 1 point/s, a buffer for ~14 h (overnight). Don’t close the tab or let the computer sleep. The data also persists in browser memory and survives a page reload. For an archive press “Download CSV”.',
+ 'btn.csv':'Download CSV','btn.clr':'Clear history','hint.npts':'points in memory:','u.ph':'pH',
+ // dynamic
+ 'valid.ready':'ready','valid.notready':'not ready','over.ok':'within norm','over.over':' over',
+ 'pc.ok':'ready · electrode OK','pc.check':'ready · check electrode','pc.notready':'not ready',
+ 'wait.cal':'awaiting calibration…','wait.data':'awaiting data…','nowin':'no points in window','zoom':'zoom',
+ 'ph.shown':'pH shown','ph.true':'pH true','hv.true':'true ','hv.shown':'shown ',
+ 'mk.eq':'equilibrium','mk.start':'start','mk.end':'end','fromStart':' s from start',
+ 'u.na':'nA','u.v':'V','u.mv':'mV','u.ma':'mA','u.vv':'V/V','u.s':'s','ax.s':' s',
+ 'cap.calib':'Real pH (calibrated) · measurement','cap.mark':' (from mark)','cap.ideal':'Real pH (ideal Nernst) · measurement','cap.volt':'Voltage S (V) — pH after board calibration',
+ 'calph.notready':'buffer calibration not ready yet','calph.acid':'acid ','calph.alk':'alkaline ','calph.off1':'offset ','calph.off2':' mV @pH7',
+ 'eq.stab':'stabilizing…','eq.eq':'equilibrium','eq.stopped':'stopped','eq.clickStart':'click START on the Real pH graph','eq.clickEnd':'now click END','eq.fewpts':'too few points in the selected window','eq.eqManual':'equilibrium (manual)',
+ 'on.live':'board responding','on.dead':'no response',
+ 'lbl.show':'plot:','seg.ph':'pH','seg.sv':'S, V','seg.mv':'electrode mV',
+ 'cap.svmeas':'Voltage S (V) · measurement','cap.mvmeas':'Electrode input (mV) · measurement',
+ 'cfm.cal':'Reset board calibration (E→S points)?','cfm.buf':'Reset electrode calibration (3 buffers)?','cfm.hist':'Clear all graph history?',
+ 'btn.pause':'Pause','btn.resume':'Resume'
+}};
+let lang='ua'; try{lang=localStorage.getItem('calLang')||'ua';}catch(e){} if(lang!=='en')lang='ua';
+function T(k){return (L[lang]&&L[lang][k]!=null)?L[lang][k]:(L.ua[k]!=null?L.ua[k]:k);}
 function applyLang(){
-  document.documentElement.lang=LANG; document.title=T('pH calibrator');
-  document.querySelectorAll('#lang button').forEach(b=>b.classList.toggle('on',b.dataset.l===LANG));
-  i18nMo.disconnect(); trTree(document.body); i18nObserve();
+  document.documentElement.lang=(lang==='ua')?'uk':'en';
+  document.title=T('title');
+  document.querySelectorAll('[data-t]').forEach(el=>{const k=el.getAttribute('data-t');if(L[lang][k]!=null)el.innerHTML=L[lang][k];});
+  const a=document.getElementById('lua'),b=document.getElementById('len');
+  if(a)a.classList.toggle('lsel',lang==='ua'); if(b)b.classList.toggle('lsel',lang==='en');
+  try{updPauseLbl();}catch(e){}
 }
-document.querySelectorAll('#lang button').forEach(b=>b.addEventListener('click',e=>{ e.stopPropagation(); setLang(b.dataset.l); }));
-// After a language switch, repaint at once everything built from numbers through T().
-function relang(){ try{ renderInfo(); if(lastD){ fill(lastD); drawCal(lastD); drawPh(lastD); } drawTSAll(); }catch(e){} }
+function setLang(x){lang=(x==='en')?'en':'ua';try{localStorage.setItem('calLang',lang);}catch(e){}applyLang();
+  try{drawTSAll();if(lastD){drawCal(lastD);drawPh(lastD);}}catch(e){}}
 
 function fmt(x,d){return (x==null||isNaN(x))?'–':Number(x).toFixed(d)}
 function fmtN(x){return (x==null||isNaN(x))?'–':(Math.abs(x)<0.1?Number(x).toFixed(3):Number(x).toFixed(1))}
 function fmtL(x){if(x==null||isNaN(x))return '–';let v=Number(x);if(Math.abs(v)<0.005)v=0;return Math.abs(v)<1?v.toFixed(2):v.toFixed(1);}
-let rEdited=false, nEdited=false;
+let rEdited=false, nEdited=false, tEdited=false;
 document.getElementById('rin').addEventListener('input',()=>rEdited=true);
 document.getElementById('nin').addEventListener('input',()=>nEdited=true);
+document.getElementById('btin').addEventListener('input',()=>tEdited=true);
 
 const CS=getComputedStyle(document.documentElement);
 const COL={line:CS.getPropertyValue('--line').trim(),dim:CS.getPropertyValue('--muted').trim(),
   grn:CS.getPropertyValue('--accent').trim(),amb:CS.getPropertyValue('--warn').trim(),
   bad:CS.getPropertyValue('--bad').trim(),blu:CS.getPropertyValue('--blue').trim(),fg:'#fff'};
-const log=[]; const LOG_MAX=50000;   // the whole session: {t, pa (reference pH), ps (real pH), sv (S, V), il (leakage nA)}
-let lastLogT=0; const LOG_EVERY=1000;  // the screen updates 4×/s, the history gets 1 point/s -> 50000 ≈ 14 h (a night)
-const tsview={};                     // zoom window of a time chart (id -> {a,b} in ms); absent = whole history
-const panS={};                       // drag (pan) state of a chart
-let eq={run:false,t0:0,p0:null,samp:[],done:false,tset:0,t63:'—',pfin:0,tsAbs:0};  // automatic equilibrium measurement
-const msel={mode:0,a:0,b:0};         // manual equilibrium limits on the chart (0=off, 1=waiting for start, 2=waiting for end)
-let lastD=null; const maps={}, hover={};   // values shown on hover over the charts
+const log=[]; const LOG_MAX=50000;   // уся історія сесії: {t, pa (рН опорний), ps (рН реальний), sv (S, В), il (витік нА)}
+let lastLogT=0; const LOG_EVERY=1000;  // екран оновлюється 4×/с, а в історію пишемо 1 точку/с → 50000 ≈ 14 год (ніч)
+const tsview={};                     // вікно зуму графіка часу (id -> {a,b} у мс); відсутнє = уся історія від старту
+const selR={}, pinchS={}, tapT={}; let lastTouch=0;  // новий зум: виділення мишею (px), щипок, час останнього тапу, захист від compat-mouse після дотику
+const yview={};                      // вертикальне Y-вікно графіка (id -> {lo,hi} у одиницях величини); відсутнє = авто
+let eq={run:false,t0:0,p0:null,samp:[],done:false,tset:0,t63:'—',pfin:0,tsAbs:0};  // автоматичний вимір рівноваги
+const msel={mode:0,a:0,b:0};         // ручний вибір меж рівноваги на графіку (0=вимк, 1=чекає початок, 2=чекає кінець)
+let lastD=null; const maps={}, hover={};   // показ значень при наведенні на графіки
 
 function fit(cv){const dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
   if(cv.width!=Math.round(w*dpr)||cv.height!=Math.round(h*dpr)){cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);}
@@ -775,7 +881,7 @@ function drawCal(d){
   maps.cCal={x0,x1,y0,y1,readout:function(px){
     const e=eMn+(eMx-eMn)*(px-x0)/(x1-x0);
     let my=null,sl=null;if(d.valid){sl=d.zero+d.gain/1000*e;my=Y(sl);}
-    return {mx:X(e),my:my,lines:['E='+e.toFixed(0)+' '+T('mV'), sl!=null?('S='+sl.toFixed(3)+' '+T('V')):'']};}};
+    return {mx:X(e),my:my,lines:['E='+e.toFixed(0)+' '+T('u.mv'), sl!=null?('S='+sl.toFixed(3)+' '+T('u.v')):'']};}};
   drawHover('cCal',c,w,h,maps.cCal);
 }
 
@@ -784,7 +890,7 @@ function drawPh(d){
   c.clearRect(0,0,w,h);const x0=36,x1=w-8,y0=8,y1=h-30;
   c.strokeStyle=COL.line;c.lineWidth=1;c.beginPath();c.moveTo(x0,y0);c.lineTo(x0,y1);c.lineTo(x1,y1);c.stroke();
   c.font='11px system-ui';c.fillStyle=COL.dim;c.textAlign='left';
-  if(!d.valid){maps.cPh=null;c.fillText(T('waiting for calibration…'),x0+8,y0+16);return;}
+  if(!d.valid){maps.cPh=null;c.fillText(T('wait.cal'),x0+8,y0+16);return;}
   const p1=7-d.e1/59.16,p2=7-d.e2/59.16;
   let lo=Math.min(p1,p2),hi=Math.max(p1,p2);const pad=(hi-lo)*0.12||1;lo-=pad;hi+=pad;
   const err=(d.vin-d.e)/59.16;
@@ -794,7 +900,7 @@ function drawPh(d){
     c.globalAlpha=.3;c.strokeStyle=COL.line;c.beginPath();c.moveTo(x0,Y(p));c.lineTo(x1,Y(p));c.stroke();c.globalAlpha=1;
     c.fillStyle=COL.dim;c.fillText(p.toFixed(1),x0-4,Y(p)+3);}
   c.textAlign='center';for(let i=0;i<=4;i++){const p=lo+(hi-lo)*i/4;c.fillText(p.toFixed(1),X(p),y1+14);}
-  c.textAlign='left';c.fillText(T('pH reading'),4,y0+2);c.textAlign='right';c.fillText(T('pH true'),x1,y1+26);
+  c.textAlign='left';c.fillText(T('ph.shown'),4,y0+2);c.textAlign='right';c.fillText(T('ph.true'),x1,y1+26);
   c.strokeStyle=COL.grn;c.lineWidth=2;c.beginPath();c.moveTo(X(lo),Y(lo));c.lineTo(X(hi),Y(hi));c.stroke();
   c.setLineDash([5,4]);c.strokeStyle=COL.amb;c.lineWidth=1.8;c.beginPath();c.moveTo(X(lo),Y(lo-err));c.lineTo(X(hi),Y(hi-err));c.stroke();c.setLineDash([]);
   const pt=7-d.e/59.16;
@@ -802,36 +908,39 @@ function drawPh(d){
   c.fillStyle=COL.amb;c.beginPath();c.arc(X(pt),Y(pt-err),4.5,0,7);c.fill();
   maps.cPh={x0,x1,y0,y1,readout:function(px){
     const p=lo+(hi-lo)*(px-x0)/(x1-x0);
-    return {mx:X(p),my:Y(p-err),lines:[T('true {0}',p.toFixed(2)),T('reading {0}',(p-err).toFixed(2))]};}};
+    return {mx:X(p),my:Y(p-err),lines:[T('hv.true')+p.toFixed(2),T('hv.shown')+(p-err).toFixed(2)]};}};
   drawHover('cPh',c,w,h,maps.cPh);
 }
 
-// Generic chart of a value over time: whole history, zoom and pan.
-// id - canvas, arr - the log array, key - field, color, unit - hover label (English, goes through T).
-// marks - a number (one «equilibrium» marker) or an array of {t,label,color}.
-// k2/col2/u2/msp2 - optional second curve with its own right axis, e.g. voltage S over pH.
-function drawTS(id,arr,key,color,unit,marks,minSpan,k2,col2,u2,msp2){
+// Універсальний графік величини в часі з усією історією, зумом і зсувом.
+// id-канвас, arr-масив log, key-поле, color-колір, unit-підпис у підказці, markT-мітка (0 якщо нема).
+// Один графік у часі. marks — число (один маркер «рівновага») або масив {t,label,color}.
+// k2/col2/u2/msp2 — необовʼязкова друга крива (власна права вісь): напр. напруга S поверх рН.
+function drawTS(id,arr,key,color,unit,marks,minSpan,k2,col2,u2,msp2,prec){
   const cv=document.getElementById(id);if(!cv){maps[id]=null;return;}const {c,w,h}=fit(cv);
   const two=!!k2;c.clearRect(0,0,w,h);const x0=48,x1=w-(two?46:10),y0=12,y1=h-18;
   c.strokeStyle=COL.line;c.lineWidth=1;c.beginPath();c.moveTo(x0,y0);c.lineTo(x0,y1);c.lineTo(x1,y1);c.stroke();
   c.font='11px system-ui';c.textAlign='left';c.fillStyle=COL.dim;
   const all=arr.filter(p=>p[key]!=null&&!isNaN(p[key]));
-  if(all.length<2){maps[id]=null;c.fillText(T('waiting for data…'),x0+8,y0+16);return;}
+  if(all.length<2){maps[id]=null;c.fillText(T('wait.data'),x0+8,y0+16);return;}
   const tF0=all[0].t,tFN=all[all.length-1].t;
   let va=tF0,vb=tFN;const vw=tsview[id];
   if(vw){va=Math.max(tF0,vw.a);vb=Math.min(tFN,vw.b);if(vb-va<500){va=tF0;vb=tFN;}}
-  const zoomed=va>tF0||vb<tFN;
+  const zoomed=va>tF0||vb<tFN||!!yview[id];
   let lo=0,hi=all.length-1;
   while(lo<all.length&&all[lo].t<va)lo++;if(lo>0)lo--;
   while(hi>0&&all[hi].t>vb)hi--;if(hi<all.length-1)hi++;
   const pts=all.slice(lo,hi+1);
-  if(pts.length<2){maps[id]=null;c.fillText(T('no points in the window'),x0+8,y0+16);return;}
-  function scale(kk,msp){let mn=1e9,mx=-1e9;for(const p of pts){const v=p[kk];if(v==null||isNaN(v))continue;if(v<mn)mn=v;if(v>mx)mx=v;}
-    if(mn>mx){mn=0;mx=1;}if(mn===mx){mn-=0.1;mx+=0.1;}
-    if(msp&&(mx-mn)<msp){const cc=(mn+mx)/2;mn=cc-msp/2;mx=cc+msp/2;}
-    const rng=mx-mn,adec=rng<0.03?3:(rng<0.3?2:(rng<3?1:0)),dd=rng*0.12;mn-=dd;mx+=dd;
+  if(pts.length<2){maps[id]=null;c.fillText(T('nowin'),x0+8,y0+16);return;}
+  function scale(kk,msp,fixed){let mn,mx,adec;
+    if(fixed){mn=Math.min(fixed.lo,fixed.hi);mx=Math.max(fixed.lo,fixed.hi);if(mx-mn<1e-9){mn-=0.05;mx+=0.05;}
+      adec=(mx-mn)<0.03?3:((mx-mn)<0.3?2:((mx-mn)<3?1:0));          // ручне Y-вікно: без паддінга і minSpan
+    }else{mn=1e9;mx=-1e9;for(const p of pts){const v=p[kk];if(v==null||isNaN(v))continue;if(v<mn)mn=v;if(v>mx)mx=v;}
+      if(mn>mx){mn=0;mx=1;}if(mn===mx){mn-=0.1;mx+=0.1;}
+      if(msp&&(mx-mn)<msp){const cc=(mn+mx)/2;mn=cc-msp/2;mx=cc+msp/2;}
+      const rng=mx-mn,dd=rng*0.12;adec=rng<0.03?3:(rng<0.3?2:(rng<3?1:0));mn-=dd;mx+=dd;}
     return {mn,mx,adec,Y:v=>y1-(y1-y0)*(v-mn)/(mx-mn)};}
-  const S1=scale(key,minSpan),mn=S1.mn,mx=S1.mx,adec=S1.adec,Y=S1.Y;
+  const S1=scale(key,minSpan,yview[id]),mn=S1.mn,mx=S1.mx,adec=S1.adec,Y=S1.Y;
   const S2=two?scale(k2,msp2):null,Y2=S2?S2.Y:null;
   const sp=Math.max(1,vb-va),X=t=>x0+(x1-x0)*(t-va)/sp;
   c.textAlign='right';
@@ -841,8 +950,8 @@ function drawTS(id,arr,key,color,unit,marks,minSpan,k2,col2,u2,msp2){
     c.fillStyle=two?color:COL.dim;c.fillText(t,x0-4,yy+3);}
   if(two){c.textAlign='left';
     for(let i=0;i<=2;i++){const v=S2.mn+(S2.mx-S2.mn)*i/2;c.fillStyle=col2;c.fillText(v.toFixed(S2.adec),x1+4,Y2(v)+3);}}
-  c.fillStyle=COL.dim;c.textAlign='left';c.fillText(T('{0} s',Math.round((va-tF0)/1000)),x0+1,y1+14);
-  c.textAlign='right';c.fillText(T('{0} s',Math.round((vb-tF0)/1000)),x1,y1+14);
+  c.fillStyle=COL.dim;c.textAlign='left';c.fillText(Math.round((va-tF0)/1000)+T('ax.s'),x0+1,y1+14);
+  c.textAlign='right';c.fillText(Math.round((vb-tF0)/1000)+T('ax.s'),x1,y1+14);
   const stride=Math.max(1,Math.floor(pts.length/1800));
   if(two){c.strokeStyle=col2;c.lineWidth=1.4;c.globalAlpha=.9;c.beginPath();
     let st=false;for(let i=0;i<pts.length;i+=stride){const p=pts[i];if(p[k2]==null||isNaN(p[k2]))continue;const xx=X(p.t),yy=Y2(p[k2]);st?c.lineTo(xx,yy):c.moveTo(xx,yy);st=true;}
@@ -850,40 +959,88 @@ function drawTS(id,arr,key,color,unit,marks,minSpan,k2,col2,u2,msp2){
   c.strokeStyle=color;c.lineWidth=1.8;c.beginPath();
   for(let i=0;i<pts.length;i+=stride){const p=pts[i];i?c.lineTo(X(p.t),Y(p[key])):c.moveTo(X(p.t),Y(p[key]));}
   {const p=pts[pts.length-1];c.lineTo(X(p.t),Y(p[key]));}c.stroke();
-  const mks=Array.isArray(marks)?marks:(marks?[{t:marks,label:'equilibrium',color:COL.fg}]:[]);
+  const mks=Array.isArray(marks)?marks:(marks?[{t:marks,label:T('mk.eq'),color:COL.fg}]:[]);
   for(const mk of mks){if(!mk||!(mk.t>=va&&mk.t<=vb))continue;const mxp=X(mk.t),cl=mk.color||COL.fg;
     c.strokeStyle=cl;c.lineWidth=1.5;c.setLineDash([4,3]);
     c.beginPath();c.moveTo(mxp,y0);c.lineTo(mxp,y1);c.stroke();c.setLineDash([]);
     const rt=mxp>x1-64;c.fillStyle=cl;c.font='10px system-ui';c.textAlign=rt?'right':'left';
-    c.fillText(T(mk.label||''),mxp+(rt?-3:3),y0+10);}
+    c.fillText(mk.label||'',mxp+(rt?-3:3),y0+10);}
   if(zoomed){c.fillStyle=COL.amb;c.font='10px system-ui';c.textAlign='right';c.fillText(T('zoom'),x1,y0+10);}
-  maps[id]={x0,x1,y0,y1,va,vb,tF0,tFN,readout:function(px){
+  const sr=selR[id];                       // 2D-прямокутник виділення мишею: ширина→зум X, висота→зум Y
+  if(sr){const ax=Math.max(x0,Math.min(sr.ax,x1)),bx=Math.max(x0,Math.min(sr.bx,x1));
+    const ay=Math.max(y0,Math.min(sr.ay,y1)),by=Math.max(y0,Math.min(sr.by,y1));
+    const rx=Math.min(ax,bx),rw=Math.abs(bx-ax),ry=Math.min(ay,by),rh=Math.abs(by-ay);
+    c.save();c.fillStyle='rgba(255,255,255,.12)';c.fillRect(rx,ry,rw,rh);
+    c.strokeStyle=COL.amb;c.lineWidth=1;c.strokeRect(rx+.5,ry+.5,Math.max(0,rw-1),Math.max(0,rh-1));c.restore();}
+  const rb=document.getElementById('rz_'+id);if(rb)rb.hidden=!zoomed;   // кнопка «скинути зум» — лише коли зумлено
+  maps[id]={x0,x1,y0,y1,va,vb,tF0,tFN,ymn:mn,ymx:mx,readout:function(px){
     const tt=va+(vb-va)*(px-x0)/(x1-x0);
     let bi=0,bd=1e9;for(let i=0;i<pts.length;i++){const dx=Math.abs(pts[i].t-tt);if(dx<bd){bd=dx;bi=i;}}
     const p=pts[bi],fromStart=Math.round((p.t-tF0)/1000);
-    let vt=p[key].toFixed(Math.max(2,adec));if(/^-0\.?0*$/.test(vt))vt=vt.slice(1);
-    const L=[vt+' '+T(unit)];
-    if(two&&p[k2]!=null&&!isNaN(p[k2]))L.push(p[k2].toFixed(Math.max(2,S2.adec))+' '+T(u2));
-    L.push(T('{0} s from the start',fromStart));
+    let vt=p[key].toFixed(prec!=null?prec:Math.max(2,adec));if(/^-0\.?0*$/.test(vt))vt=vt.slice(1);
+    const L=[vt+' '+unit];
+    if(two&&p[k2]!=null&&!isNaN(p[k2]))L.push(p[k2].toFixed(Math.max(2,S2.adec))+' '+u2);
+    L.push(fromStart+T('fromStart'));
     return {mx:X(p.t),my:Y(p[key]),lines:L};}};
   drawHover(id,c,w,h,maps[id]);
 }
 function drawTSAll(){
-  drawTS('cLeak',log,'il',COL.amb,'nA',0,0);
-  drawTS('cPhA',log,'pa',COL.amb,'pH',0,0.1);
+  drawTS('cLeak',log,'il',COL.amb,T('u.na'),0,0);
+  drawTS('cPhA',log,'pa',COL.amb,T('u.ph'),0,0.1);
   const mk=[];
-  if(msel.a)mk.push({t:msel.a,label:'start',color:COL.amb});
-  if(msel.b)mk.push({t:msel.b,label:'end',color:COL.amb});
-  if(!msel.a&&!msel.b&&eq.done&&eq.tsAbs)mk.push({t:eq.tsAbs,label:'equilibrium',color:COL.fg});
-  drawTS('cPhS',log,'ps',COL.grn,'pH',mk,0.1,'sv',COL.blu,'V',0);
+  if(msel.a)mk.push({t:msel.a,label:T('mk.start'),color:COL.amb});
+  if(msel.b)mk.push({t:msel.b,label:T('mk.end'),color:COL.amb});
+  if(!msel.a&&!msel.b&&eq.done&&eq.tsAbs)mk.push({t:eq.tsAbs,label:T('mk.eq'),color:COL.fg});
+  const cap=document.getElementById('cPhSCap');
+  // Що будувати на графіку виміру — за селектором (рН / S / мВ). Уся історія вже в логу,
+  // тож перемикання лише перемальовує, не починає з нуля. Точність: pH 3, S 3, мВ 1.
+  if(phSMode==='sv'){
+    if(cap)cap.textContent=T('cap.svmeas');
+    drawTS('cPhS',log,'sv',COL.blu,T('u.v'),mk,0,null,null,null,null,3);
+  }else if(phSMode==='mv'){
+    if(cap)cap.textContent=T('cap.mvmeas');
+    drawTS('cPhS',log,'vin',COL.amb,T('u.mv'),mk,0,null,null,null,null,1);
+  }else{ // 'ph'
+    const pcv=lastD&&lastD.pcv;
+    if(pcv){ if(cap)cap.textContent=T('cap.calib')+(measT?T('cap.mark'):'');
+      const seg=measT?log.filter(p=>p.t>=measT):log;
+      drawTS('cPhS',seg,'ps',COL.grn,T('u.ph'),mk,0.1,null,null,null,null,3);
+    }else{ if(cap)cap.textContent=T('cap.ideal');
+      drawTS('cPhS',log,'ps',COL.grn,T('u.ph'),mk,0.1,null,null,null,null,3);
+    }
+  }
+  drawCalPh();
   const n=document.getElementById('npts');if(n)n.textContent=log.length;
 }
+// Калібрувальний графік: pH -> мВ електрода, вимір (двосегментно) vs ідеал Нернста.
+function drawCalPh(){
+  const cv=document.getElementById('cCalPh');if(!cv)return;const {c,w,h}=fit(cv);
+  c.clearRect(0,0,w,h);c.font='10px system-ui';const d=lastD;
+  const x0=54,x1=w-14,y0=14,y1=h-26;
+  if(!d||!d.pcv){c.fillStyle=COL.dim;c.textAlign='left';c.fillText(T('calph.notready'),x0+6,y0+20);return;}
+  const pts=[[d.pc0,d.bv0],[d.pc1,d.bv1],[d.pc2,d.bv2]],pMin=3.5,pMax=9.5,NS=59.16;
+  const idA=NS*(7-pMin),idB=NS*(7-pMax);
+  let vLo=idB,vHi=idA;for(const q of pts){vLo=Math.min(vLo,q[1]);vHi=Math.max(vHi,q[1]);}
+  const pad=(vHi-vLo)*0.14||10;vLo-=pad;vHi+=pad;
+  const X=p=>x0+(p-pMin)/(pMax-pMin)*(x1-x0),Y=v=>y1-(v-vLo)/(vHi-vLo)*(y1-y0);
+  c.textAlign='right';
+  for(let i=0;i<=4;i++){const v=vLo+(vHi-vLo)*i/4,yy=Y(v);c.globalAlpha=.3;c.strokeStyle=COL.line;c.beginPath();c.moveTo(x0,yy);c.lineTo(x1,yy);c.stroke();c.globalAlpha=1;c.fillStyle=COL.dim;c.fillText(v.toFixed(0),x0-6,yy+3);}
+  for(let p=4;p<=9;p++){const xx=X(p);c.globalAlpha=p===7?.7:.25;c.strokeStyle=COL.line;c.beginPath();c.moveTo(xx,y0);c.lineTo(xx,y1);c.stroke();c.globalAlpha=1;c.fillStyle=COL.dim;c.textAlign='center';c.fillText('pH '+p,xx,y1+16);}
+  c.strokeStyle=COL.amb;c.lineWidth=2;c.setLineDash([7,5]);c.beginPath();c.moveTo(X(pMin),Y(idA));c.lineTo(X(pMax),Y(idB));c.stroke();c.setLineDash([]);
+  const sa=(pts[1][1]-pts[0][1])/(pts[1][0]-pts[0][0]),sb=(pts[2][1]-pts[1][1])/(pts[2][0]-pts[1][0]);
+  const mp=[[pMin,pts[0][1]+sa*(pMin-pts[0][0])],pts[0],pts[1],pts[2],[pMax,pts[2][1]+sb*(pMax-pts[2][0])]];
+  c.strokeStyle=COL.grn;c.lineWidth=2.4;c.beginPath();mp.forEach((q,i)=>i?c.lineTo(X(q[0]),Y(q[1])):c.moveTo(X(q[0]),Y(q[1])));c.stroke();
+  pts.forEach(q=>{c.fillStyle=COL.grn;c.beginPath();c.arc(X(q[0]),Y(q[1]),5,0,7);c.fill();c.strokeStyle=COL.fg;c.lineWidth=1.5;c.stroke();c.fillStyle=COL.fg;c.textAlign='center';c.fillText(q[1].toFixed(1)+' '+T('u.mv'),X(q[0]),Y(q[1])-10);});
+  c.fillStyle=COL.grn;c.textAlign='left';c.fillText(T('calph.acid')+d.psa.toFixed(1)+'%',X(4.5),Y((pts[0][1]+pts[1][1])/2)-6);
+  c.fillText(T('calph.alk')+d.psb.toFixed(1)+'%',X(7.3),Y((pts[1][1]+pts[2][1])/2)+14);
+  c.fillStyle=COL.amb;c.fillText(T('calph.off1')+d.pof.toFixed(0)+T('calph.off2'),X(7)+4,Y(0)+16);
+}
 
-// Electrode equilibrium: how fast the pH settles (works on the real pH from S).
+// Вимір швидкості встановлення рівноваги електрода (працює з реальним рН із S).
 function eqSet(id,t){document.getElementById(id).textContent=t;}
 function eqStart(){eq={run:true,t0:Date.now(),p0:null,samp:[],done:false,tset:0,t63:'—',pfin:0,tsAbs:0};
-  eqSet('eqstate','settling…');['eqt','eqdrift','eqset','eqt63'].forEach(i=>eqSet(i,'—'));eqSet('eqph','—');}
-function eqStop(){eq.run=false;eqSet('eqstate', eq.done?'equilibrium':'stopped');}
+  eqSet('eqstate',T('eq.stab'));['eqt','eqdrift','eqset','eqt63'].forEach(i=>eqSet(i,'—'));eqSet('eqph','—');}
+function eqStop(){eq.run=false;eqSet('eqstate', eq.done?T('eq.eq'):T('eq.stopped'));}
 function eqTick(ps){
   if(!eq.run||ps==null||isNaN(ps))return;
   const now=Date.now();if(eq.p0==null)eq.p0=ps;
@@ -897,31 +1054,31 @@ function eqTick(ps){
   const band=Math.max(0.005,parseFloat(document.getElementById('eqband').value)||0.02);
   if(elapsed>=WIN/1000 && ptp<=band){
     eq.done=true;eq.tset=elapsed;eq.pfin=(mn+mx)/2;eq.tsAbs=now;
-    eqSet('eqset',eq.tset.toFixed(0));eqSet('eqph',eq.pfin.toFixed(2));eqSet('eqstate','equilibrium');
+    eqSet('eqset',eq.tset.toFixed(0));eqSet('eqph',eq.pfin.toFixed(2));eqSet('eqstate',T('eq.eq'));
     const target=eq.p0+0.63*(eq.pfin-eq.p0);
     for(const s of eq.samp){if((eq.pfin>=eq.p0&&s.p>=target)||(eq.pfin<eq.p0&&s.p<=target)){eq.t63=((s.t-eq.t0)/1000).toFixed(1);break;}}
     eqSet('eqt63',eq.t63);
-  }else{eqSet('eqstate','settling…');}
+  }else{eqSet('eqstate',T('eq.stab'));}
 }
 
-// Manual variant: the limits of the transient are clicked on the «real pH» chart.
+// Ручний варіант: межі перехідного процесу вибираються кліками на графіку «рН реальний».
 function selStart(){msel.mode=1;msel.a=0;msel.b=0;eq.done=false;
-  eqSet('eqstate','click the START on the real pH chart');['eqt','eqdrift','eqset','eqt63'].forEach(i=>eqSet(i,'—'));eqSet('eqph','—');drawTSAll();}
+  eqSet('eqstate',T('eq.clickStart'));['eqt','eqdrift','eqset','eqt63'].forEach(i=>eqSet(i,'—'));eqSet('eqph','—');drawTSAll();}
 function eqManual(){
   const a=Math.min(msel.a,msel.b),b=Math.max(msel.a,msel.b);
   const seg=log.filter(p=>p.ps!=null&&!isNaN(p.ps)&&p.t>=a&&p.t<=b);
-  if(seg.length<2){eqSet('eqstate','too few points in the selected window');return;}
+  if(seg.length<2){eqSet('eqstate',T('eq.fewpts'));return;}
   const t0=seg[0].t,tEnd=seg[seg.length-1].t,p0=seg[0].ps;
   const tailFrom=tEnd-Math.min(10000,(tEnd-t0)*0.25);const tail=seg.filter(s=>s.t>=tailFrom);
   let sum=0,mn=1e9,mx=-1e9;for(const s of tail){sum+=s.ps;if(s.ps<mn)mn=s.ps;if(s.ps>mx)mx=s.ps;}
   const pfin=sum/tail.length,drift=mx-mn,tset=(tEnd-t0)/1000;
   const target=p0+0.63*(pfin-p0);let t63='—';
   for(const s of seg){if((pfin>=p0&&s.ps>=target)||(pfin<p0&&s.ps<=target)){t63=((s.t-t0)/1000).toFixed(1);break;}}
-  eqSet('eqstate','equilibrium (manual)');eqSet('eqt',tset.toFixed(0));eqSet('eqdrift',drift.toFixed(3));
+  eqSet('eqstate',T('eq.eqManual'));eqSet('eqt',tset.toFixed(0));eqSet('eqdrift',drift.toFixed(3));
   eqSet('eqset',tset.toFixed(0));eqSet('eqt63',t63);eqSet('eqph',pfin.toFixed(2));
 }
 
-// Hover overlay: vertical line, a dot on the curve and a label with the value.
+// Накладка при наведенні: вертикальна лінія, точка на кривій і підпис зі значенням.
 function drawHover(id,c,w,h,m){
   const hv=hover[id];if(!hv||!m||!m.readout)return;
   const px=Math.max(m.x0,Math.min(m.x1,hv.x));
@@ -943,40 +1100,71 @@ function hookHover(id,redraw){
   cv.addEventListener('pointermove',ev=>{const b=cv.getBoundingClientRect();hover[id]={x:ev.clientX-b.left,y:ev.clientY-b.top};redraw();});
   cv.addEventListener('pointerleave',()=>{hover[id]=null;redraw();});
 }
-// Time charts: hover + wheel zoom + drag to pan + double click = whole history.
+// Зум графіків часу. Миша: протягнути РАМКУ — ширина задає зум по X, висота — зум по Y (горизонтальний
+// мазок = тільки X, як раніше); наведення без кнопки — підказка; подвійний клік — скинути (обидві осі).
+// Дотик: два пальці — щипок по X; один палець — підказка; подвійний тап — скинути. X-вікно tsview[id]={a,b}
+// (мс), Y-вікно yview[id]={lo,hi} (одиниці величини); обидва null = авто. Кнопка «скинути зум» — лише при зумі.
+function zoomReset(id){tsview[id]=null;yview[id]=null;hover[id]=null;try{drawTSAll();}catch(e){}}
+function tsPick(m,px){return m.va+(m.vb-m.va)*(Math.max(m.x0,Math.min(m.x1,px))-m.x0)/((m.x1-m.x0)||1);} // піксель → час
+function yPick(m,py){return m.ymn+(m.y1-Math.max(m.y0,Math.min(m.y1,py)))*(m.ymx-m.ymn)/((m.y1-m.y0)||1);} // піксель → значення
 function hookTS(id){
   const cv=document.getElementById(id);if(!cv)return;
-  cv.addEventListener('pointermove',ev=>{const b=cv.getBoundingClientRect();const x=ev.clientX-b.left,y=ev.clientY-b.top;
-    const ps=panS[id],m=maps[id];
-    if(ps&&ps.active&&m){const sp=m.vb-m.va,pw=(m.x1-m.x0)||1;let dt=(ps.x-x)*sp/pw;
-      let a=ps.a+dt,b=ps.b+dt;if(a<m.tF0){b+=m.tF0-a;a=m.tF0;}if(b>m.tFN){a-=b-m.tFN;b=m.tFN;}if(a<m.tF0)a=m.tF0;
-      hover[id]=null;tsview[id]=(b>=m.tFN-1)?null:{a,b};drawTSAll();return;}
+  const xp=cx=>{const r=cv.getBoundingClientRect();return cx-r.left;};
+  const yp=cy=>{const r=cv.getBoundingClientRect();return cy-r.top;};
+  // --- Миша (десктоп): 2D-рамка (ширина→зум X, висота→зум Y) + наведення ---
+  cv.addEventListener('mousemove',ev=>{if(Date.now()-lastTouch<600)return;const x=xp(ev.clientX),y=yp(ev.clientY);
+    if(selR[id]){selR[id].bx=x;selR[id].by=y;drawTSAll();return;}
     hover[id]={x,y};drawTSAll();});
-  cv.addEventListener('pointerleave',()=>{hover[id]=null;const ps=panS[id];if(ps)ps.active=false;drawTSAll();});
-  cv.addEventListener('pointerdown',ev=>{const b=cv.getBoundingClientRect();const m=maps[id];if(!m)return;
-    if(id==='cPhS'&&msel.mode){const x=Math.max(m.x0,Math.min(m.x1,ev.clientX-b.left));
-      const tt=m.va+(m.vb-m.va)*(x-m.x0)/((m.x1-m.x0)||1);
-      if(msel.mode===1){msel.a=tt;msel.b=0;msel.mode=2;eqSet('eqstate','now click the END');}
+  cv.addEventListener('mouseleave',()=>{if(Date.now()-lastTouch<600)return;hover[id]=null;selR[id]=null;drawTSAll();});
+  cv.addEventListener('mousedown',ev=>{if(Date.now()-lastTouch<600)return;const m=maps[id];if(!m)return;const x=xp(ev.clientX),y=yp(ev.clientY);
+    if(id==='cPhS'&&msel.mode){const tt=tsPick(m,x);
+      if(msel.mode===1){msel.a=tt;msel.b=0;msel.mode=2;eqSet('eqstate',T('eq.clickEnd'));}
       else{msel.b=tt;msel.mode=0;eqManual();}
       drawTSAll();return;}
-    panS[id]={active:true,x:ev.clientX-b.left,a:m.va,b:m.vb};try{cv.setPointerCapture(ev.pointerId)}catch(e){}});
-  cv.addEventListener('pointerup',()=>{const ps=panS[id];if(ps)ps.active=false;});
-  cv.addEventListener('dblclick',()=>{tsview[id]=null;drawTSAll();});
-  cv.addEventListener('wheel',ev=>{ev.preventDefault();const m=maps[id];if(!m)return;
-    const rc=cv.getBoundingClientRect();const frac=Math.min(1,Math.max(0,(ev.clientX-rc.left-m.x0)/((m.x1-m.x0)||1)));
-    const tc=m.va+(m.vb-m.va)*frac,full=m.tFN-m.tF0;
-    let span=Math.min(full,Math.max(1000,(m.vb-m.va)*(ev.deltaY<0?0.8:1.25)));
-    let a=tc-span*frac,b=a+span;if(a<m.tF0){a=m.tF0;b=a+span;}if(b>m.tFN){b=m.tFN;a=b-span;}if(a<m.tF0)a=m.tF0;
-    tsview[id]=(span>=full)?null:{a,b};drawTSAll();},{passive:false});
+    selR[id]={ax:x,ay:y,bx:x,by:y};ev.preventDefault();});
+  cv.addEventListener('mouseup',ev=>{if(Date.now()-lastTouch<600)return;const s=selR[id];selR[id]=null;const m=maps[id];
+    if(s&&m){const wX=Math.abs(s.bx-s.ax),wY=Math.abs(s.by-s.ay);
+      if(wX>8){const a=tsPick(m,s.ax),b=tsPick(m,s.bx),lo=Math.min(a,b),hi=Math.max(a,b);
+        if(hi-lo>=500)tsview[id]=(hi-lo>=(m.tFN-m.tF0)-1)?null:{a:lo,b:hi};}
+      if(wY>8){const a=yPick(m,s.ay),b=yPick(m,s.by),lo=Math.min(a,b),hi=Math.max(a,b);
+        if(hi-lo>1e-9)yview[id]={lo,hi};}
+    }
+    drawTSAll();});
+  cv.addEventListener('dblclick',()=>zoomReset(id));
+  // --- Дотик (мобільний): щипок двома пальцями + підказка одним + подвійний тап ---
+  cv.addEventListener('touchstart',ev=>{lastTouch=Date.now();const m=maps[id];
+    if(ev.touches.length===2&&m){const x0t=xp(ev.touches[0].clientX),x1t=xp(ev.touches[1].clientX),mid=(x0t+x1t)/2;
+      pinchS[id]={d:Math.abs(x0t-x1t)||1,at:tsPick(m,mid),span:m.vb-m.va,pw:(m.x1-m.x0)||1,x0:m.x0,tF0:m.tF0,tFN:m.tFN};
+      selR[id]=null;tapT[id]=0;ev.preventDefault();return;}
+    if(ev.touches.length===1){const x=xp(ev.touches[0].clientX);
+      if(id==='cPhS'&&msel.mode&&m){const tt=tsPick(m,x);
+        if(msel.mode===1){msel.a=tt;msel.b=0;msel.mode=2;eqSet('eqstate',T('eq.clickEnd'));}
+        else{msel.b=tt;msel.mode=0;eqManual();}
+        ev.preventDefault();drawTSAll();return;}
+      const now=Date.now();if(now-(tapT[id]||0)<300){zoomReset(id);tapT[id]=0;}else{tapT[id]=now;
+        const r=cv.getBoundingClientRect();hover[id]={x,y:ev.touches[0].clientY-r.top};drawTSAll();}}
+  },{passive:false});
+  cv.addEventListener('touchmove',ev=>{lastTouch=Date.now();const p=pinchS[id];
+    if(p&&ev.touches.length===2){ev.preventDefault();
+      const x0t=xp(ev.touches[0].clientX),x1t=xp(ev.touches[1].clientX),mid=(x0t+x1t)/2,d=Math.abs(x0t-x1t)||1;
+      const full=p.tFN-p.tF0;let span=Math.min(full,Math.max(1000,p.span*p.d/d));
+      let a=p.at-(mid-p.x0)*span/p.pw,b=a+span;
+      if(a<p.tF0){a=p.tF0;b=a+span;}if(b>p.tFN){b=p.tFN;a=b-span;}if(a<p.tF0)a=p.tF0;
+      tsview[id]=(span>=full)?null:{a,b};drawTSAll();return;}
+    if(ev.touches.length===1){const r=cv.getBoundingClientRect();hover[id]={x:xp(ev.touches[0].clientX),y:ev.touches[0].clientY-r.top};drawTSAll();}
+  },{passive:false});
+  cv.addEventListener('touchend',ev=>{lastTouch=Date.now();if(ev.touches.length<2)pinchS[id]=null;
+    if(ev.touches.length===0){hover[id]=null;drawTSAll();}});
 }
 hookTS('cLeak');hookTS('cPhA');hookTS('cPhS');
 hookHover('cCal',()=>{try{if(lastD)drawCal(lastD);}catch(e){}});
 hookHover('cPh',()=>{try{if(lastD)drawPh(lastD);}catch(e){}});
 
-// Export the whole history to a CSV file (the browser downloads it); autosave to browser storage.
+// Експорт усієї історії у CSV-файл (завантажує браузер) і автозбереження в памʼять браузера.
 function expCsv(){
-  let s='t_ms,pH_real_S,S_V\n';
-  for(const p of log){s+=p.t+','+(p.ps!=null?p.ps.toFixed(3):'')+','+(p.sv!=null?p.sv.toFixed(4):'')+'\n';}
+  let s='t_ms,pH_real_S,S_V,S_raw_V,shunt_drop_V,I_mA\n';
+  for(const p of log){s+=p.t+','+(p.ps!=null?p.ps.toFixed(3):'')+','+(p.sv!=null?p.sv.toFixed(4):'')+','+
+    (p.sr!=null?p.sr.toFixed(4):'')+','+(p.sd!=null?p.sd.toFixed(4):'')+','+(p.im!=null?p.im.toFixed(2):'')+'\n';}
   const bl=new Blob([s],{type:'text/csv'});const u=URL.createObjectURL(bl);
   const a=document.createElement('a');a.href=u;a.download='calibrator_'+new Date().toISOString().replace(/[:.]/g,'-')+'.csv';
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);
@@ -986,186 +1174,173 @@ function saveLog(){try{const n=log.length,st=Math.max(0,n-LOG_MAX);localStorage.
 function loadLog(){try{const r=localStorage.getItem('calLog');if(r){const a=JSON.parse(r);if(Array.isArray(a))for(const p of a)log.push(p);}}catch(e){}}
 loadLog();setInterval(saveLog,30000);
 function togBlk(id){document.getElementById(id).classList.toggle('collapsed');saveUI();}
-// Collapsed blocks (and other page toggles) survive a reload - in browser storage.
+// Стан згорток (та інші перемикачі сторінки) переживає перезавантаження — у памʼяті браузера.
 function saveUI(){try{const s={};document.querySelectorAll('.block').forEach(b=>s[b.id]=b.classList.contains('collapsed'));localStorage.setItem('calUI',JSON.stringify(s));}catch(e){}}
 function loadUI(){try{const r=localStorage.getItem('calUI');if(!r)return;const s=JSON.parse(r);for(const id in s){const el=document.getElementById(id);if(el)el.classList.toggle('collapsed',!!s[id]);}}catch(e){}}
 loadUI();
+// Згортання окремих графіків (напр. «рН опорний») — не потрібен при реальних вимірах.
+function togGraph(id){const el=document.getElementById(id);if(!el)return;el.classList.toggle('collapsed');
+  try{const s=JSON.parse(localStorage.getItem('calG')||'{}');s[id]=el.classList.contains('collapsed');localStorage.setItem('calG',JSON.stringify(s));}catch(e){}
+  try{drawTSAll();}catch(e){}}
+function loadGraphs(){try{const s=JSON.parse(localStorage.getItem('calG')||'{}');for(const id in s){const el=document.getElementById(id);if(el)el.classList.toggle('collapsed',!!s[id]);}}catch(e){}}
+loadGraphs();
+// Селектор графіка виміру «Real pH … measurement»: що будувати на cPhS — рН / S / мВ електрода.
+// Точність показу: pH — 3 знаки, S (В) — 3 знаки, мВ — 1 знак.
+let phSMode='ph'; try{phSMode=localStorage.getItem('calPhSMode')||'ph';}catch(e){}
+if(!['ph','sv','mv'].includes(phSMode))phSMode='ph';
+function setPhSMode(m){phSMode=m;try{localStorage.setItem('calPhSMode',m);}catch(e){}updPhSSeg();try{drawTSAll();}catch(e){}}
+function updPhSSeg(){['ph','sv','mv'].forEach(m=>{const b=document.getElementById('sg_'+m);if(b)b.classList.toggle('on',phSMode===m);});}
+updPhSSeg();
+// Підтвердження перед скиданням параметрів (щоб випадково не стерти калібрування).
+function postC(u,k){if(confirm(T(k)))post(u);}
+function calUsb(){const cur=(lastD&&lastD.usb!=null)?lastD.usb.toFixed(2):'5.00';const v=prompt(T('pr.usb'),cur);if(v==null)return;const n=parseFloat((''+v).replace(',','.'));if(isFinite(n)&&n>0.5)fetch('/calusb?v='+n,{method:'POST'});}
+let measT=0; try{measT=+localStorage.getItem('measT')||0;}catch(e){}  // мітка «Почати вимір»
+function measStart(){measT=Date.now();try{localStorage.setItem('measT',measT);}catch(e){}drawTSAll();}
 
-// Fill the readings from a /data packet (and again after a language switch).
-function fill(d){
-  const psv=d.valid?(7-d.vin/59.16):null;   // real pH (from board output S)
-  e.textContent=fmt(d.e,1); s.textContent=fmt(d.s,3);
-  phA.textContent=fmt(d.ph,2); phS.textContent=(psv!=null)?psv.toFixed(2):'–';
-  noise.textContent=fmt(d.noise,2);
-  cur.textContent=fmt(d.i,2);
-  il.textContent=d.valid?fmtL(d.il):'–';
-  vin.textContent=d.valid?fmt(d.vin,1):'–';
-  document.getElementById('normlbl').textContent=fmtN(d.norm);
-  const ov=document.getElementById('over');
-  if(d.valid){
-    const k=Math.abs(d.il)/((d.norm>0)?d.norm:1);
-    if(k<=1){ov.textContent='within the limit';ov.style.color=COL.grn;}
-    else{ov.textContent=T('×{0} over',(k>=10?k.toFixed(0):k.toFixed(1)));ov.style.color=(Math.abs(d.il)>=1.0?COL.bad:COL.amb);}
-  }else{ov.textContent='–';ov.style.color='';}
-  p1.textContent=d.h1?T('E={0} mV, S={1} V',fmt(d.e1,1),fmt(d.s1,3)):'—';
-  p2.textContent=d.h2?T('E={0} mV, S={1} V',fmt(d.e2,1),fmt(d.s2,3)):'—';
-  gain.textContent=d.valid?fmt(d.gain,3):'—';
-  zero.textContent=d.valid?fmt(d.zero,3):'—';
-  gaint.textContent=d.valid?fmt(Math.abs(d.gain),2):'–';
-  document.getElementById('zerot').textContent=d.valid?fmt(d.zero,2):'–';
-  if(d.valid){const dl=d.vin-d.e;document.getElementById('leakoff').textContent=fmt(dl,0);document.getElementById('leakph').textContent=fmt(Math.abs(dl)/59.16,1);}
-  else{document.getElementById('leakoff').textContent='—';document.getElementById('leakph').textContent='—';}
-  const v=document.getElementById('valid');
-  v.textContent=d.valid?'ready':'not ready'; v.className=d.valid?'ok':'bad';
-  document.getElementById('leakhint').style.display=d.valid?'none':'';
-  if(!rEdited) document.getElementById('rin').value=fmt(d.r,2);
-  if(!nEdited) document.getElementById('nin').value=fmtN(d.norm);
-  return psv;
-}
+// Індикатор «плата відповідає»: зелений, поки йдуть пуші; сірий, якщо замовкли.
+let onlineT=0;
+function setOnline(ok){const el=document.getElementById('online');if(!el)return;
+  el.classList.toggle('on',ok);el.classList.toggle('off',!ok);el.title=ok?T('on.live'):T('on.dead');}
+function markOnline(){onlineT=Date.now();setOnline(true);}
+setInterval(()=>{if(Date.now()-onlineT>1500)setOnline(false);},700);   // вартовий
 
-let busy=false;
-async function refresh(){
-  if(busy) return; busy=true;                         // do not pile up requests
-  const ctrl=new AbortController(); const to=setTimeout(()=>ctrl.abort(),2000);
-  try{
-    const d=await (await fetch('/data',{signal:ctrl.signal})).json();
+// Пауза читання: прилад далі шле, але сторінка ігнорує пакети (графіки/покази заморожені).
+let paused=false;
+function updPauseLbl(){const b=document.getElementById('pauseBtn');if(b)b.textContent=paused?T('btn.resume'):T('btn.pause');}
+function togPause(){paused=!paused;const b=document.getElementById('pauseBtn');if(b)b.classList.toggle('p',paused);updPauseLbl();}
+
+// Застосувати один пакет телеметрії (прийшов по SSE або разовим /data).
+function applyData(d){
+    markOnline();            // прилад живий — індикатор горить навіть на паузі
+    if(paused)return;        // пауза: ігноруємо пакет, графіки стоять
     lastD=d;
-    const psv=fill(d);
+    const psv=d.pcv?d.pr:(d.valid?(7-d.vin/59.16):null);   // рН реальний: буферний або ідеал. Нернст
+    e.textContent=fmt(d.e,1); s.textContent=fmt(d.s,3);
+    sraw.textContent=fmt(d.s_raw,3); sdrop.textContent=fmt(d.shunt_drop,3);
+    phA.textContent=fmt(d.ph,2); phS.textContent=(psv!=null)?psv.toFixed(2):'–';
+    noise.textContent=fmt(d.noise,2);
+    cur.textContent=fmt(d.i,2);
+    {const u=document.getElementById('usb');if(u&&d.usb!=null)u.textContent=fmt(d.usb,3);}
+    il.textContent=d.valid?fmtL(d.il):'–';
+    vin.textContent=d.valid?fmt(d.vin,1):'–';
+    document.getElementById('normlbl').textContent=fmtN(d.norm);
+    const ov=document.getElementById('over');
+    if(d.valid){
+      const k=Math.abs(d.il)/((d.norm>0)?d.norm:1);
+      if(k<=1){ov.textContent=T('over.ok');ov.style.color=COL.grn;}
+      else{ov.textContent='×'+(k>=10?k.toFixed(0):k.toFixed(1))+T('over.over');ov.style.color=(Math.abs(d.il)>=1.0?COL.bad:COL.amb);}
+    }else{ov.textContent='–';ov.style.color='';}
+    p1.textContent=d.h1?('E='+fmt(d.e1,1)+' '+T('u.mv')+', S='+fmt(d.s1,3)+' '+T('u.v')):'—';
+    p2.textContent=d.h2?('E='+fmt(d.e2,1)+' '+T('u.mv')+', S='+fmt(d.s2,3)+' '+T('u.v')):'—';
+    gain.textContent=d.valid?fmt(d.gain,3):'—';
+    zero.textContent=d.valid?fmt(d.zero,3):'—';
+    gaint.textContent=d.valid?fmt(Math.abs(d.gain),2):'–';
+    document.getElementById('zerot').textContent=d.valid?fmt(d.zero,2):'–';
+    if(d.valid){const dl=d.vin-d.e;document.getElementById('leakoff').textContent=fmt(dl,0);document.getElementById('leakph').textContent=fmt(Math.abs(dl)/59.16,1);}
+    else{document.getElementById('leakoff').textContent='—';document.getElementById('leakph').textContent='—';}
+    const v=document.getElementById('valid');
+    v.textContent=d.valid?T('valid.ready'):T('valid.notready'); v.className=d.valid?'ok':'bad';
+    document.getElementById('leakhint').style.display=d.valid?'none':'';
+    if(!rEdited) document.getElementById('rin').value=fmt(d.r,2);
+    if(!nEdited) document.getElementById('nin').value=fmtN(d.norm);
+    for(let i=0;i<3;i++){const h=d['bh'+i],bv=d['bv'+i];
+      document.getElementById('bv'+i).textContent=h?bv.toFixed(1):'–';
+      document.getElementById('bs'+i).textContent=h?'✓':'–';
+      const pe=document.getElementById('pc'+i);
+      if(pe)pe.textContent=(Math.abs(d.tc-25)<0.05)?'':('→ '+d['pc'+i].toFixed(2));}
+    if(!tEdited)document.getElementById('btin').value=fmt(d.tc,1);
+    document.getElementById('psa').textContent=d.pcv?d.psa.toFixed(1):'–';
+    document.getElementById('psb').textContent=d.pcv?d.psb.toFixed(1):'–';
+    document.getElementById('pof').textContent=d.pcv?d.pof.toFixed(1):'–';
+    const pcs=document.getElementById('pcstate');
+    if(d.pcv){const ok=d.psa>=92&&d.psa<=103&&d.psb>=92&&d.psb<=103&&Math.abs(d.pof)<30;
+      pcs.textContent=ok?T('pc.ok'):T('pc.check');pcs.style.color=ok?COL.grn:COL.amb;}
+    else{pcs.textContent=T('pc.notready');pcs.style.color='';}
     const now=Date.now();
     if(now-lastLogT>=LOG_EVERY){lastLogT=now;
-      log.push({t:now,pa:d.ph,ps:psv,sv:d.s,il:(d.valid?d.il:null)}); if(log.length>LOG_MAX)log.shift();}
+      log.push({t:now,pa:d.ph,ps:psv,sv:d.s,sr:d.s_raw,sd:d.shunt_drop,im:d.i,vin:(d.valid?d.vin:null),il:(d.valid?d.il:null)}); if(log.length>LOG_MAX)log.shift();}
     eqTick(psv);
     drawCal(d); drawPh(d); drawTSAll();
-  }catch(err){}
-  finally{ clearTimeout(to); busy=false; }
 }
-async function post(u){await fetch(u,{method:'POST'});setTimeout(refresh,120)}
+// SSE: сервер пушить стан ~5×/с; EventSource сам перепідключається при обриві.
+let es=null;
+function startSSE(){
+  try{es=new EventSource('/events');
+    es.onmessage=ev=>{try{applyData(JSON.parse(ev.data));}catch(e){}};
+    es.onerror=()=>setOnline(false);           // браузер перепідключиться автоматично
+  }catch(e){ setInterval(pokeOnce,300); }       // фолбек: якщо EventSource недоступний — разові /data
+}
+async function pokeOnce(){try{const d=await (await fetch('/data')).json();applyData(d);}catch(e){}}
+async function post(u){await fetch(u,{method:'POST'});setTimeout(pokeOnce,100)}
 async function setR(){
   const meg=document.getElementById('rin').value;
   await fetch('/setr?meg='+encodeURIComponent(meg),{method:'POST'});
-  rEdited=false; setTimeout(refresh,120);
+  rEdited=false; setTimeout(pokeOnce,100);
 }
 async function setNorm(){
   const na=document.getElementById('nin').value;
   await fetch('/setnorm?na='+encodeURIComponent(na),{method:'POST'});
-  nEdited=false; setTimeout(refresh,120);
+  nEdited=false; setTimeout(pokeOnce,100);
 }
-
-// --- Wi-Fi: status, network scan, save. The calibrator restarts with the new network.
-let info=null,ssidFilled=false;
-function renderInfo(){
-  const w=document.getElementById('wst');if(!info){w.textContent='–';return;}
-  document.getElementById('ver').textContent='v'+info.ver;
-  if(!info.ap&&info.ok) w.textContent=T('Connected to «{0}» · {1} · signal {2} dBm',info.ssid,info.ip,info.rssi);
-  else if(!info.ap) w.textContent=T('Connecting to «{0}»…',info.ssid);
-  else if(info.ssid) w.textContent=T('Access point «{0}» · {1} · could not connect to «{2}»',info.apssid,info.ip,info.ssid);
-  else w.textContent=T('Access point «{0}» · {1} · no network saved',info.apssid,info.ip);
-  document.getElementById('apban').style.display=info.ap?'':'none';
-  const ws=document.getElementById('wssid');if(!ssidFilled&&info.ssid){ws.value=info.ssid;ssidFilled=true;}
+async function setTemp(){
+  const c=document.getElementById('btin').value;
+  await fetch('/settemp?c='+encodeURIComponent(c),{method:'POST'});
+  tEdited=false; setTimeout(pokeOnce,100);
 }
-async function loadInfo(){try{info=await (await fetch('/info')).json();renderInfo();}catch(e){}}
-function openWifi(){const b=document.getElementById('blk3');b.classList.remove('collapsed');saveUI();
-  b.scrollIntoView({behavior:'smooth'});document.getElementById('wssid').focus();}
-let scanning=false;
-async function scanWifi(){
-  if(scanning)return; scanning=true;
-  const sel=document.getElementById('wlist');sel.innerHTML='';
-  const o=document.createElement('option');o.value='';o.textContent=T('searching…');sel.appendChild(o);
-  try{
-    for(let i=0;i<20;i++){                      // a scan takes a few seconds: poll once a second
-      const r=await (await fetch('/scan')).json();
-      if(!r.busy){
-        sel.innerHTML='';const h=document.createElement('option');h.value='';
-        h.textContent=r.n.length?T('— choose a network —'):T('no networks found');sel.appendChild(h);
-        r.n.sort((a,b)=>b.r-a.r).forEach(n=>{const op=document.createElement('option');op.value=n.s;
-          op.textContent=n.s+'  ('+n.r+' dBm'+(n.e?'':T(', open'))+')';sel.appendChild(op);});
-        break;}
-      await new Promise(f=>setTimeout(f,1000));
-    }
-  }catch(e){}
-  scanning=false;
-}
-async function saveWifi(){
-  const ss=document.getElementById('wssid').value.trim(),pw=document.getElementById('wpass').value;
-  if(ss.length<1||ss.length>32){alert(T('Enter the network name (1-32 characters).'));return;}
-  if(pw.length&&(pw.length<8||pw.length>63)){alert(T('The password is 8-63 characters, or empty for an open network.'));return;}
-  if(!confirm(T('Save «{0}» and restart the calibrator?',ss)))return;
-  try{const r=await fetch('/wifi',{method:'POST',body:new URLSearchParams({ssid:ss,pass:pw})});
-    if(!r.ok){alert(await r.text());return;}}catch(e){}
-  document.getElementById('wst').textContent=T('Restarting… reconnect in ~20 s.');
-}
-async function forgetWifi(){
-  if(!confirm(T('Forget the saved network and restart as an access point?')))return;
-  try{await fetch('/wififorget',{method:'POST'});}catch(e){}
-  document.getElementById('wst').textContent=T('Restarting… reconnect in ~20 s.');
-}
-
 window.addEventListener('resize',()=>{try{drawTSAll();if(lastD){drawCal(lastD);drawPh(lastD);}}catch(e){}});
 applyLang();
-loadInfo();setInterval(loadInfo,5000);
-setInterval(refresh,250); refresh();
+startSSE(); pokeOnce();
 </script>
 </body></html>)HTML";
 
-// JSON of the present state (runs in the AsyncTCP task - read only).
-static void sendData(AsyncWebServerRequest* req) {
-  char buf[512];
-  snprintf(buf, sizeof(buf),
+// Зібрати JSON поточного стану у buf (лише читає спільні значення). Повертає довжину.
+static size_t buildDataJson(char* buf, size_t n) {
+  return (size_t)snprintf(buf, n,
     "{\"e\":%.1f,\"s\":%.3f,\"ph\":%.2f,\"vin\":%.1f,\"il\":%.3f,\"noise\":%.2f,"
     "\"h1\":%d,\"e1\":%.1f,\"s1\":%.3f,\"h2\":%d,\"e2\":%.1f,\"s2\":%.3f,"
-    "\"valid\":%d,\"gain\":%.3f,\"zero\":%.3f,\"r\":%.3f,\"norm\":%.3f,\"i\":%.2f}",
+    "\"valid\":%d,\"gain\":%.3f,\"zero\":%.3f,\"r\":%.3f,\"norm\":%.3f,\"i\":%.2f,"
+    "\"pr\":%.2f,\"pcv\":%d,\"psa\":%.1f,\"psb\":%.1f,\"pof\":%.1f,\"tc\":%.1f,"
+    "\"usb\":%.3f,\"s_raw\":%.3f,\"shunt_drop\":%.3f,\"shunt_valid\":%d,"
+    "\"pc0\":%.2f,\"pc1\":%.2f,\"pc2\":%.2f,"
+    "\"bh0\":%d,\"bv0\":%.1f,\"bh1\":%d,\"bv1\":%.1f,\"bh2\":%d,\"bv2\":%.1f}",
     g_E_mV, g_S_V, g_pH, g_Vin_mV, g_Ileak_nA, g_noise_mV,
     haveP1 ? 1 : 0, E1_mV, S1_V, haveP2 ? 1 : 0, E2_mV, S2_V,
-    calValid ? 1 : 0, gainS * 1000.0f, zeroS, Rseries / 1.0e6f, leakNormNA, g_I_mA);
+    calValid ? 1 : 0, gainS * 1000.0f, zeroS, Rseries / 1.0e6f, leakNormNA, g_I_mA,
+    g_pH_real, phCalValid ? 1 : 0,
+    phCalValid ? fabsf(phSlopeAcid) / PH_SLOPE * 100.0f : 0.0f,
+    phCalValid ? fabsf(phSlopeBase) / PH_SLOPE * 100.0f : 0.0f, phOffset_mV, bufTempC,
+    g_usb_V, g_S_raw_V, g_shuntDrop_V, g_shuntValid ? 1 : 0,
+    bufPhAt(0), bufPhAt(1), bufPhAt(2),
+    bufHave[0] ? 1 : 0, bufVin[0], bufHave[1] ? 1 : 0, bufVin[1], bufHave[2] ? 1 : 0, bufVin[2]);
+}
+
+// /data — одноразовий знімок (фолбек/діагностика; основний канал — SSE /events).
+static void sendData(AsyncWebServerRequest* req) {
+  char buf[1024];
+  buildDataJson(buf, sizeof(buf));
   req->send(200, "application/json", buf);
 }
 
-// Network status and version for the Wi-Fi block (the page polls every 5 s).
-static void sendInfo(AsyncWebServerRequest* req) {
-  String j = "{\"ver\":\"" CAL_VERSION "\",\"ap\":";
-  j += apMode ? 1 : 0;
-  j += ",\"ok\":";   j += staConnected ? 1 : 0;
-  j += ",\"ssid\":\"";   j += jsonEsc(wifiSsid);
-  j += "\",\"ip\":\"";  j += g_ip;
-  j += "\",\"rssi\":"; j += staConnected ? WiFi.RSSI() : 0;
-  j += ",\"apssid\":\""; j += AP_SSID; j += "\"}";
-  req->send(200, "application/json", j);
-}
-
-// Network scan is asynchronous: the first request starts it, the next ones get {"busy":1}
-// until it is done; the finished list is served once and deleted (the next request rescans).
-static void sendScan(AsyncWebServerRequest* req) {
-  int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_FAILED) { WiFi.scanNetworks(true); n = WIFI_SCAN_RUNNING; }
-  if (n == WIFI_SCAN_RUNNING) { req->send(200, "application/json", "{\"busy\":1}"); return; }
-  String j = "{\"n\":[";
-  bool first = true;
-  for (int i = 0; i < n; i++) {
-    String s = WiFi.SSID(i);
-    if (!s.length()) continue;                       // hidden network
-    bool dup = false;                                // several access points of one network - one line
-    for (int k = 0; k < i && !dup; k++) dup = (WiFi.SSID(k) == s);
-    if (dup) continue;
-    if (!first) j += ',';
-    first = false;
-    j += "{\"s\":\""; j += jsonEsc(s);
-    j += "\",\"r\":"; j += WiFi.RSSI(i);
-    j += ",\"e\":";   j += (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? 0 : 1;
-    j += '}';
-  }
-  j += "]}";
-  WiFi.scanDelete();
-  req->send(200, "application/json", j);
-}
-
-// Web server routes (shared by STA and the fallback AP). The server listens at once.
+// Маршрути веб-сервера (спільні для STA і запасної AP). Сервер слухає одразу.
 static void startServerRoutes() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200, "text/html", INDEX_HTML); });
+  // HTML великий (~70 КБ): віддаємо потоком із PROGMEM (AsyncProgmemResponse, чанками),
+  // БЕЗ копії у heap-String — інакше на фрагментованій купі суцільний блок не виділяється і
+  // сторінка приходить порожня (Content-Length 0). send_P(PGM_P) на ESP32 саме так і робить.
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){
+    r->send(200, "text/html", (const uint8_t*)INDEX_HTML, strlen_P(INDEX_HTML));
+  });
   server.on("/data", HTTP_GET, sendData);
   server.on("/p1",  HTTP_POST, [](AsyncWebServerRequest* r){ req_capP1  = true; r->send(200, "text/plain", "ok"); });
   server.on("/p2",  HTTP_POST, [](AsyncWebServerRequest* r){ req_capP2  = true; r->send(200, "text/plain", "ok"); });
   server.on("/calreset", HTTP_POST, [](AsyncWebServerRequest* r){ req_calRst = true; r->send(200, "text/plain", "ok"); });
   server.on("/zeroa", HTTP_POST, [](AsyncWebServerRequest* r){ req_zeroA = true; r->send(200, "text/plain", "ok"); });
+  server.on("/calusb", HTTP_POST, [](AsyncWebServerRequest* r){   // калібрувати дільник USB: v=істинна напруга
+    if (r->hasParam("v")) {
+      float v = r->getParam("v")->value().toFloat();
+      if (v > 0.5f) { req_usbTrue = v; req_calUsb = true; }
+    }
+    r->send(200, "text/plain", "ok");
+  });
   server.on("/setr", HTTP_POST, [](AsyncWebServerRequest* r){
     if (r->hasParam("meg")) {
       float meg = r->getParam("meg")->value().toFloat();
@@ -1180,146 +1355,146 @@ static void startServerRoutes() {
     }
     r->send(200, "text/plain", "ok");
   });
-  server.on("/info", HTTP_GET, sendInfo);
-  server.on("/scan", HTTP_GET, sendScan);
-  // New network: validated here, saved and restarted by loop() (NVS in one task).
-  server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest* r){
-    String s = r->hasParam("ssid", true) ? r->getParam("ssid", true)->value() : String();
-    String p = r->hasParam("pass", true) ? r->getParam("pass", true)->value() : String();
-    if (s.length() < 1 || s.length() > 32) { r->send(400, "text/plain", "SSID: 1-32 characters"); return; }
-    if (p.length() && (p.length() < 8 || p.length() > 63)) {
-      r->send(400, "text/plain", "Password: 8-63 characters, or empty for an open network"); return;
+  server.on("/bufcap", HTTP_POST, [](AsyncWebServerRequest* r){
+    if (r->hasParam("i")) {
+      int i = r->getParam("i")->value().toInt();
+      if (i >= 0 && i < 3) req_bufCap = i + 1;
     }
-    strlcpy(req_ssid, s.c_str(), sizeof(req_ssid));
-    strlcpy(req_pass, p.c_str(), sizeof(req_pass));
-    req_wifiSave = true;
     r->send(200, "text/plain", "ok");
   });
-  server.on("/wififorget", HTTP_POST, [](AsyncWebServerRequest* r){ req_wifiForget = true; r->send(200, "text/plain", "ok"); });
+  server.on("/bufclr", HTTP_POST, [](AsyncWebServerRequest* r){ req_bufClr = true; r->send(200, "text/plain", "ok"); });
+  server.on("/setbuf", HTTP_POST, [](AsyncWebServerRequest* r){   // відновити 3 буфери: vin у мВ (+ опц. tc)
+    if (r->hasParam("v0") && r->hasParam("v1") && r->hasParam("v2")) {
+      req_bufV[0] = r->getParam("v0")->value().toFloat();
+      req_bufV[1] = r->getParam("v1")->value().toFloat();
+      req_bufV[2] = r->getParam("v2")->value().toFloat();
+      req_bufTcV  = r->hasParam("tc") ? r->getParam("tc")->value().toFloat() : 25.0f;
+      req_setBuf = true;
+    }
+    r->send(200, "text/plain", "ok");
+  });
+  server.on("/settemp", HTTP_POST, [](AsyncWebServerRequest* r){
+    if (r->hasParam("c")) {
+      float c = r->getParam("c")->value().toFloat();
+      if (c > -5.0f && c < 100.0f) { req_TempVal = c; req_setTemp = true; }
+    }
+    r->send(200, "text/plain", "ok");
+  });
+  events.onConnect([](AsyncEventSourceClient* c){   // новому клієнту — одразу поточний стан
+    char buf[1024]; buildDataJson(buf, sizeof(buf)); c->send(buf, nullptr, millis());
+  });
+  server.addHandler(&events);
   server.onNotFound([](AsyncWebServerRequest* r){ r->redirect("/"); });   // captive portal
   server.begin();
   wifiOk = true;
 }
 
-// Own access point + captive DNS. AP_STA mode, so the network scan works from the page.
-// STA attempts are stopped: their channel hopping while reconnecting breaks the access point.
-static void startAP() {
-  apMode = true;
-  WiFi.setAutoReconnect(false);
-  WiFi.disconnect();
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);      // SuperMini - see wifiBegin()
-  IPAddress ip = WiFi.softAPIP();
-  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(DNS_PORT, "*", ip);
-  MDNS.begin(HOSTNAME);
-  MDNS.addService("http", "tcp", 80);
-  snprintf(g_ip, sizeof(g_ip), "%s", ip.toString().c_str());
-  connMsgUntil = millis() + 10000;         // show the AP address on the OLED for 10 s
-  Serial.printf("Access point \"%s\" (password %s): http://%s/ - set the network in the Wi-Fi block\n",
-                AP_SSID, AP_PASS, g_ip);
-}
-
-// Start Wi-Fi in the BACKGROUND - does NOT block the display. wifiTick() in loop() finishes it.
+// Запустити Wi-Fi у ФОНІ — НЕ блокує екран. Під'єднання добиває wifiTick() у loop().
 static void wifiBegin() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(HOSTNAME);
-  // Allow channels 1..13 (EU routers may sit on 12/13).
+  // Дозволити канали 1..13 (Livebox/EU можуть стояти на 12/13).
   wifi_country_t ctry = { {'F','R',0}, 1, 13, 20, WIFI_COUNTRY_POLICY_MANUAL };
   esp_wifi_set_country(&ctry);
-  // ESP32-C3 SuperMini: lower TX power - otherwise its antenna breaks the handshake.
+  // ESP32-C3 SuperMini: знижуємо потужність передавача — інакше рве рукостискання.
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  startServerRoutes();   // the server listens at once and answers as soon as there is an IP
-  if (!wifiSsid.length()) {                 // no network set -> access point at once
-    Serial.println(F("Wi-Fi: no network set"));
-    startAP();
-    return;
-  }
-  WiFi.begin(wifiSsid.c_str(), wifiPass.length() ? wifiPass.c_str() : nullptr);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   wifiStartMs = millis();
-  Serial.printf("Wi-Fi: connecting to \"%s\" in the background...\n", wifiSsid.c_str());
+  Serial.printf("Wi-Fi: під'єднання до \"%s\" у фоні...\n", WIFI_SSID);
+  startServerRoutes();   // сервер слухає одразу, віддаватиме щойно з'явиться IP
 }
 
-// Wi-Fi state: called every cycle from loop(), never blocks.
+// Стан Wi-Fi: викликається щоцикл у loop(), не блокує.
 static void wifiTick() {
-  if (apMode) return;                       // already in fallback mode
+  if (apMode) return;                       // уже в запасному режимі
   if (WiFi.status() == WL_CONNECTED) {
     if (!staConnected) {
       staConnected = true;
       MDNS.begin(HOSTNAME);
       MDNS.addService("http", "tcp", 80);
       snprintf(g_ip, sizeof(g_ip), "%s", WiFi.localIP().toString().c_str());
-      connMsgUntil = millis() + 4000;      // show the IP on the OLED for 4 s
-      Serial.printf("Wi-Fi OK: http://%s/ or http://%s.local/\n", g_ip, HOSTNAME);
+      connMsgUntil = millis() + 4000;      // показати IP на екрані 4 с
+      Serial.printf("Wi-Fi ок: http://%s/ або http://%s.local/\n", g_ip, HOSTNAME);
     }
     return;
   }
-  // Timeout only for the FIRST connection. A network that was there and dropped comes back
-  // through autoReconnect: a short router outage used to switch to the access point for good.
-  if (!staConnected && millis() - wifiStartMs > 20000) {
-    Serial.printf("Wi-Fi: could not connect to \"%s\" within 20 s\n", wifiSsid.c_str());
-    startAP();
+  if (millis() - wifiStartMs > 20000) {     // за 20 с не зайшло -> запасна AP + captive-DNS
+    apMode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    IPAddress ip = WiFi.softAPIP();
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(DNS_PORT, "*", ip);
+    MDNS.begin(HOSTNAME);
+    MDNS.addService("http", "tcp", 80);
+    snprintf(g_ip, sizeof(g_ip), "%s", ip.toString().c_str());
+    connMsgUntil = millis() + 6000;        // показати адресу AP на екрані 6 с
+    Serial.printf("Wi-Fi не вдалось; запасна AP \"%s\" (пароль %s): http://%s/\n",
+                  AP_SSID, AP_PASS, g_ip);
   }
 }
 
-// Saving / erasing the network from the page, and the restart. Separate from
-// processWebRequests, which runs only with an ADS - the network must be settable without one.
-static void processWifiRequests() {
-  if (req_wifiSave) {
-    req_wifiSave = false;
-    saveWifi(req_ssid, req_pass);
-    Serial.printf("Wi-Fi: network \"%s\" saved, restarting\n", req_ssid);
-    restartAt = millis() + 1500;            // let the reply reach the browser
-  }
-  if (req_wifiForget) {
-    req_wifiForget = false;
-    saveWifi("", "");
-    Serial.println(F("Wi-Fi: network forgotten, restarting as an access point"));
-    restartAt = millis() + 1500;
-  }
-  if (restartAt && (int32_t)(millis() - restartAt) >= 0) {
-    drawStatus("Restart", "", "");
-    delay(100);
-    ESP.restart();
-  }
-}
-
-// Carry out the web requests (only in loop -> I2C/NVS in one task).
+// Виконати запити від веб-обробників (тільки в loop -> I2C/NVS в одному таску).
 static void processWebRequests(float va, float vs) {
   if (req_zeroA)  { req_zeroA = false; offsetA += va; saveFloat("offA", offsetA);
-                    Serial.printf("Autozero A (web): offsetA=%.5f V\n", offsetA); }
+                    Serial.printf("Автонуль A (веб): offsetA=%.5f V\n", offsetA); }
   if (req_capP1)  { req_capP1 = false; E1_mV = va * 1000.0f; S1_V = vs; haveP1 = true;
-                    computeLeakCal(); saveLeak(); Serial.println(F("Point 1 taken")); }
+                    computeLeakCal(); saveLeak(); Serial.println(F("Точка 1 знята")); }
   if (req_capP2)  { req_capP2 = false; E2_mV = va * 1000.0f; S2_V = vs; haveP2 = true;
-                    computeLeakCal(); saveLeak(); Serial.println(F("Point 2 taken")); }
+                    computeLeakCal(); saveLeak(); Serial.println(F("Точка 2 знята")); }
   if (req_calRst) { req_calRst = false; haveP1 = haveP2 = calValid = false;
                     E1_mV = S1_V = E2_mV = S2_V = 0; saveLeak();
-                    Serial.println(F("Leakage calibration cleared")); }
+                    Serial.println(F("Калібрування витоку скинуто")); }
   if (req_setR)   { req_setR = false; Rseries = req_Rval; saveLeak();
-                    Serial.printf("R = %.3f MOhm\n", Rseries / 1.0e6f); }
+                    Serial.printf("R = %.3f МОм\n", Rseries / 1.0e6f); }
   if (req_setNorm){ req_setNorm = false; leakNormNA = req_NormVal; saveLeak();
-                    Serial.printf("Leakage limit = %.3f nA\n", leakNormNA); }
+                    Serial.printf("Норма витоку = %.3f нА\n", leakNormNA); }
+  if (req_bufCap) { int i = req_bufCap - 1; req_bufCap = 0;
+                    if (calValid && fabsf(gainS) > 1e-9f) {
+                      bufVin[i] = (vs - zeroS) / gainS;   // мВ електрода у цьому буфері
+                      bufHave[i] = true; computePhCal(); savePhCal();
+                      Serial.printf("Буфер %d (pH %.2f): vin %.1f мВ\n", i + 1, BUF_PH[i], bufVin[i]);
+                    } else Serial.println(F("Спершу калібрування плати (E->S)!")); }
+  if (req_bufClr) { req_bufClr = false;
+                    for (int i = 0; i < 3; i++) { bufHave[i] = false; bufVin[i] = 0; }
+                    phCalValid = false; savePhCal(); Serial.println(F("Буферне калібр. скинуто")); }
+  if (req_setBuf) { req_setBuf = false;
+                    for (int i = 0; i < 3; i++) { bufVin[i] = req_bufV[i]; bufHave[i] = true; }
+                    bufTempC = req_bufTcV; computePhCal(); savePhCal();
+                    Serial.printf("Буфери відновлено: %.1f / %.1f / %.1f мВ @ %.1f°C\n",
+                                  bufVin[0], bufVin[1], bufVin[2], bufTempC); }
+  if (req_setTemp){ req_setTemp = false; bufTempC = req_TempVal; computePhCal(); savePhCal();
+                    Serial.printf("T буферів = %.1f C\n", bufTempC); }
+  if (req_calUsb) { req_calUsb = false;
+                    if (g_usb_pin_mV > 50.0f && req_usbTrue > 0.5f) {
+                      usbScale = req_usbTrue / (g_usb_pin_mV / 1000.0f); saveUsbCal();
+                      Serial.printf("USB cal: %.3f В -> коеф. %.4f\n", req_usbTrue, usbScale);
+                    } }
 }
 
 // ----------------------------- setup / loop ---------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.setTxTimeoutMs(0);         // do not stall the loop for 100 ms when no monitor is open
-  delay(250);                       // briefly: let the I2C modules and USB CDC settle
+  Serial.setTxTimeoutMs(0);         // не блокувати цикл до 100 мс, коли монітор закритий
+  delay(250);                       // коротко: дати I2C-модулям і USB CDC устаканитись
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
 
   loadCal();
   loadLeak();
-  loadWifi();
+  loadPhCal();
+  loadUsbCal();
 
-  // Display and ADS FIRST, so the screen lights up as soon as power is applied
-  oled.setI2CAddress(ADDR_OLED << 1);     // u8g2 takes an 8-bit address
+  // Вбудований АЦП для напруги USB (GPIO4): 12 біт, 11 дБ (~0..2.5 В на піні = USB/2.5)
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_USB_ADC, ADC_11db);
+
+  // Дисплей і ADS — ПЕРШИМИ, щоб екран засвітився негайно після подачі живлення
+  oled.setI2CAddress(ADDR_OLED << 1);     // u8g2 адреса 8-бітна
   for (uint8_t i = 0; i < 5 && !(oledOk && adsOk); i++) {
     if (!oledOk && i2cPresent(ADDR_OLED)) { oled.begin(); oled.setContrast(255); oledOk = true; }
     if (!adsOk)  adsOk = ads.begin(ADDR_ADS, &Wire);
@@ -1327,37 +1502,35 @@ void setup() {
   }
   if (adsOk) ads.setDataRate(RATE_ADS1115_250SPS);
 
-  // FIRST FRAME at once - the network state (the screen lights up right after power-on)
-  if (oledOk) drawStatus("WiFi...", wifiSsid.c_str(), "connecting");
-  Serial.printf("pH calibrator v%s\n", CAL_VERSION);
+  // ПЕРШИЙ КАДР одразу — стан мережі (екран світиться негайно після живлення)
+  if (oledOk) drawStatus("WiFi...", WIFI_SSID, "connecting");
   i2cScan();
-  if (!oledOk) Serial.println(F("OLED not found (0x3C)"));
-  if (!adsOk)  Serial.println(F("ADS1115 not found (0x48)"));
+  if (!oledOk) Serial.println(F("OLED не знайдено (0x3C)"));
+  if (!adsOk)  Serial.println(F("ADS1115 не знайдено (0x48)"));
 
-  wifiBegin();   // Wi-Fi in the BACKGROUND - the screen is already on, loop carries on
+  wifiBegin();   // Wi-Fi у ФОНІ — екран уже світиться, loop оновлює далі
 
   Serial.printf("offA=%.5f\n", offsetA);
-  Serial.println(F("Ready. Commands: z=autozero A, Z=clear it, r=show calibration, v=input voltages."));
+  Serial.println(F("Готово. Команди: z=автонуль A, Z=скинути, r=показати кал."));
 }
 
 void loop() {
   static uint32_t last = 0;
-  if (apMode) dnsServer.processNextRequest();   // captive DNS only in the fallback AP mode
+  if (apMode) dnsServer.processNextRequest();   // captive-DNS лише в запасному AP-режимі
   if (millis() - last < PERIOD_MS) return;
   last = millis();
 
-  wifiTick();   // background Wi-Fi state (connection / fallback AP), never blocks
-  processWifiRequests();
+  wifiTick();   // фоновий стан Wi-Fi (під'єднання / запасна AP), не блокує
 
-  // While connecting, and for a few seconds after, the OLED shows the network state
+  // Поки під'єднуємось або кілька секунд після — показуємо стан мережі на OLED
   bool netScreen = (!staConnected && !apMode) || (millis() < connMsgUntil);
   if (netScreen) {
-    if (!staConnected && !apMode) drawStatus("WiFi...", wifiSsid.c_str(), "connecting");
+    if (!staConnected && !apMode) drawStatus("WiFi...", WIFI_SSID, "connecting");
     else drawStatus(staConnected ? "WiFi OK" : "AP mode", g_ip,
                     staConnected ? "calibrator.local" : AP_SSID);
   }
 
-  // re-initialise if a module came alive / was plugged in later (both)
+  // переініціалізація, якщо модуль ожив/під'єднали пізніше (обидва)
   if (!oledOk && i2cPresent(ADDR_OLED)) {
     oled.begin(); oled.setContrast(255); oledOk = true;
   }
@@ -1365,41 +1538,57 @@ void loop() {
     adsOk = ads.begin(ADDR_ADS, &Wire);
     if (adsOk) ads.setDataRate(RATE_ADS1115_250SPS);
   }
-  if (!adsOk) return;   // nothing to measure without the ADS
+  if (!adsOk) return;   // без ADS міряти нема чого
 
   float va = readA();
-  float vs = readS();
-  // Light smoothing (EMA) - removes last-digit flicker on the screen without slowing
-  // the measurement. va/vs are smoothed from here on (screen, CSV, web, points).
+  float vsRaw = readS();
+  // Легкий згладжувач (EMA) — прибирає миготіння молодшого розряду на екрані,
+  // не сповільнюючи вимір. va/vs далі йдуть уже згладжені (екран, CSV, веб, точки).
   static float fVa = 0, fVs = 0; static bool fInit = false;
-  if (!fInit) { fVa = va; fVs = vs; fInit = true; }
-  // a real change -> at once (no lag); small flicker -> EMA
+  if (!fInit) { fVa = va; fVs = vsRaw; fInit = true; }
+  // помітна зміна -> одразу (без лагу); дрібне миготіння -> згладити EMA
   fVa = (fabsf(va - fVa) > SNAP_A) ? va : fVa + DISP_ALPHA * (va - fVa);
-  fVs = (fabsf(vs - fVs) > SNAP_S) ? vs : fVs + DISP_ALPHA * (vs - fVs);
-  va = fVa; vs = fVs;
+  fVs = (fabsf(vsRaw - fVs) > SNAP_S) ? vsRaw : fVs + DISP_ALPHA * (vsRaw - fVs);
+  va = fVa; vsRaw = fVs;
 
-  g_I_mA = readI();   // board current - read before drawScreen so the screen is fresh
+  g_I_mA  = readI();   // струм плати — читаємо перед drawScreen, щоб на екрані було свіже
+  g_usb_V = readUsb(); // напруга живлення USB (вбудований АЦП)
+  float vs = vsRaw, shuntDrop = 0.0f;   // vs далі = вихід плати без падіння на шунті
+  g_shuntValid = correctSForShunt(vsRaw, g_I_mA, vs, shuntDrop);
 
-  if (!netScreen) drawScreen(va, vs);   // readings only when the network screen is not up
+  if (!netScreen) drawScreen(va, vs);   // покази лише коли не показуємо стан мережі (власний вихід плати)
 
-  // Update the values shared with the web interface (read by the AsyncTCP task)
+  // Оновити спільні значення для веб-інтерфейсу (читає таск AsyncTCP)
   float e_mV = va * 1000.0f;
   g_E_mV = e_mV;
-  g_S_V  = vs;
+  g_S_V  = vs;                    // поле s у /data — фізичний вихід плати
+  g_S_raw_V = vsRaw;
+  g_shuntDrop_V = shuntDrop;
   g_pH   = phFromA(va);
   if (calValid && fabsf(gainS) > 1e-9f) {
-    float vin_mV = (vs - zeroS) / gainS;                          // board input, mV (on the E scale)
+    float vin_mV = (vs - zeroS) / gainS;                          // вхід плати, мВ (шкала E)
     g_Vin_mV   = vin_mV;
-    g_Ileak_nA = ((vin_mV - e_mV) * 1.0e-3f) / Rseries * 1.0e9f;  // (Vin-E)/R -> nA
+    g_Ileak_nA = ((vin_mV - e_mV) * 1.0e-3f) / Rseries * 1.0e9f;  // (Vin-E)/R -> нА
+    g_pH_real  = phCalValid ? phFromBuf(vin_mV)                   // буферна мапа, якщо є
+                            : (PH_ISO - vin_mV / PH_SLOPE);       // інакше ідеальний Нернст
   } else {
-    g_Vin_mV = 0.0f; g_Ileak_nA = 0.0f;
+    g_Vin_mV = 0.0f; g_Ileak_nA = 0.0f; g_pH_real = 7.0f;
   }
 
-  // Carry out the deferred requests from the web page (I2C/NVS only here)
+  // Виконати відкладені запити з веб-сторінки (I2C/NVS лише тут)
   processWebRequests(va, vs);
 
-  // CSV on Serial: millis, A(mV), S(V), pH
-  Serial.printf("%lu,%.1f,%.4f,%.2f\n", (unsigned long)millis(), va * 1000.0f, vs, phFromA(va));
+  // SSE: пушимо свіжий стан ~5×/с усім під'єднаним клієнтам (push, а не polling)
+  static uint32_t lastEvt = 0;
+  if (events.count() && millis() - lastEvt >= 200) {
+    lastEvt = millis();
+    char buf[1024]; buildDataJson(buf, sizeof(buf));
+    events.send(buf, nullptr, millis());
+  }
+
+  // CSV у Serial: millis, A(мВ), S(В, з поправкою), pH, S сире(В), падіння шунта(В), I(мА)
+  Serial.printf("%lu,%.1f,%.4f,%.2f,%.4f,%.4f,%.2f\n", (unsigned long)millis(), va * 1000.0f, vs,
+                phFromA(va), vsRaw, shuntDrop, g_I_mA);
 
   handleSerial(va);
 }
